@@ -1,0 +1,17 @@
+name: system-info
+description: Read-only facts from Linux hosts
+version: "1.0"
+
+defaults:
+  timeout: 15s
+
+steps:
+  - name: hostname
+    command: hostname
+  - name: kernel
+    command: uname -a
+  - name: disk
+    command: df -h /
+  - name: uptime
+    command: uptime
+    continue_on_error: true

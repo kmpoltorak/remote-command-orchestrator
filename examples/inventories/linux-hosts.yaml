@@ -1,27 +1,30 @@
-# Linux hosts. Credentials are references only: no secrets in this file.
+# Credentials are references: secrets come from environment variables or key files.
 credentials:
   deploy-key:
     type: private_key
     username: deploy
     key_file: ~/.ssh/deploy_ed25519
+    sudo_password_env: DEPLOY_SUDO_PASSWORD   # omit for NOPASSWD sudo
   deploy-key-encrypted:
     type: private_key
     username: deploy
     key_file: ~/.ssh/deploy_rsa
     passphrase_env: DEPLOY_KEY_PASSPHRASE
-  ops-agent:
-    type: agent               # keys served by ssh-agent (SSH_AUTH_SOCK)
-    username: ops
+  legacy-password:
+    type: password
+    username: admin
+    password_env: LEGACY_PASSWORD            # also used for sudo by default
 
 defaults:
   port: 22
-  profile: linux
   credential: deploy-key
 
 groups:
   web:
     defaults:
-      tags: [production, web]
+      tags: [production]
+      variables:
+        ntp_server: ntp1.example.com
     hosts:
       - name: web-01
         address: 10.20.1.10
@@ -36,10 +39,12 @@ groups:
       - name: batch-01
         address: 10.20.2.10
         port: 2222
+        variables:
+          ntp_server: ntp2.example.com
 
-  agent-managed:
+  legacy:
     defaults:
-      credential: ops-agent
+      credential: legacy-password
     hosts:
-      - name: tools-01
-        address: tools-01.internal.example.com
+      - name: old-app-01
+        address: 10.20.9.5

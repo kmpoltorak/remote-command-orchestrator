@@ -1,11 +1,9 @@
 // Package credentials turns credential references into SSH auth methods and
-// provides the Redactor that scrubs secrets from every persisted or logged string.
+// provides the Redactor that scrubs secrets from everything shown or written.
 package credentials
 
 import (
 	"errors"
-	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,45 +11,36 @@ import (
 	"sync"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/kmpoltorak/remote-command-orchestrator/internal/domain"
 )
 
-// Env abstracts environment lookup for tests.
+// Env looks up environment variables (os.LookupEnv in production).
 type Env func(string) (string, bool)
 
-// Auth is a resolved authentication. Close releases agent connections.
+// Auth is resolved secret material for one endpoint. It lives only in memory.
 type Auth struct {
-	Methods []ssh.AuthMethod
-	Secrets []string
-	closers []func() error
+	Methods      []ssh.AuthMethod
+	SudoPassword string   // empty = sudo must not prompt (NOPASSWD)
+	Secrets      []string // everything the redactor must scrub
 }
 
-// Close releases resources (ssh-agent socket).
-func (a *Auth) Close() {
-	for _, c := range a.closers {
-		_ = c()
-	}
-}
-
-// Resolve reads the secret material for ref at execution time. Secrets are
-// returned so the caller can register them with a Redactor; they are never
-// persisted. Errors never include secret values.
-func Resolve(ref domain.CredentialRef, env Env) (*Auth, error) {
+// Resolve reads secrets for c at execution time. Errors never contain secret values.
+func Resolve(c domain.Credential, env Env) (*Auth, error) {
 	a := &Auth{}
-	switch ref.Type {
+	switch c.Type {
 	case "password":
-		pw, ok := env(ref.PasswordEnv)
+		pw, ok := env(c.PasswordEnv)
 		if !ok || pw == "" {
-			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: environment variable %s is not set", ref.Name, ref.PasswordEnv)
+			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: environment variable %s is not set", c.Name, c.PasswordEnv)
 		}
 		a.Secrets = append(a.Secrets, pw)
+		a.SudoPassword = pw
 		a.Methods = []ssh.AuthMethod{
 			ssh.Password(pw),
-			// Many network devices only offer keyboard-interactive.
-			ssh.KeyboardInteractive(func(_, _ string, questions []string, _ []bool) ([]string, error) {
-				answers := make([]string, len(questions))
+			// Some sshd configs only offer keyboard-interactive for passwords.
+			ssh.KeyboardInteractive(func(_, _ string, qs []string, _ []bool) ([]string, error) {
+				answers := make([]string, len(qs))
 				for i := range answers {
 					answers[i] = pw
 				}
@@ -59,56 +48,52 @@ func Resolve(ref domain.CredentialRef, env Env) (*Auth, error) {
 			}),
 		}
 	case "private_key":
-		signer, secrets, err := loadKey(ref, env)
+		signer, err := loadKey(c, env, a)
 		if err != nil {
 			return nil, err
 		}
-		a.Secrets = secrets
 		a.Methods = []ssh.AuthMethod{ssh.PublicKeys(signer)}
-	case "agent":
-		sock, ok := env("SSH_AUTH_SOCK")
-		if !ok || sock == "" {
-			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: SSH_AUTH_SOCK is not set", ref.Name)
-		}
-		conn, err := net.Dial("unix", sock)
-		if err != nil {
-			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot connect to ssh-agent: %v", ref.Name, err)
-		}
-		a.closers = append(a.closers, conn.Close)
-		a.Methods = []ssh.AuthMethod{ssh.PublicKeysCallback(agent.NewClient(conn).Signers)}
 	default:
-		return nil, domain.Fail(domain.CatAuthFailed, "credential %q: unsupported type %q", ref.Name, ref.Type)
+		return nil, domain.Fail(domain.CatAuthFailed, "credential %q: unsupported type %q", c.Name, c.Type)
+	}
+	if c.SudoPasswordEnv != "" {
+		pw, ok := env(c.SudoPasswordEnv)
+		if !ok || pw == "" {
+			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: environment variable %s is not set", c.Name, c.SudoPasswordEnv)
+		}
+		a.SudoPassword = pw
+		a.Secrets = append(a.Secrets, pw)
 	}
 	return a, nil
 }
 
-func loadKey(ref domain.CredentialRef, env Env) (ssh.Signer, []string, error) {
-	path := ExpandHome(ref.KeyFile)
+func loadKey(c domain.Credential, env Env, a *Auth) (ssh.Signer, error) {
+	path := ExpandHome(c.KeyFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// The path is not secret; the file content never appears in errors.
-		return nil, nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot read key file %s: %v", ref.Name, path, errors.Unwrap(err))
+		return nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot read key file %s: %v", c.Name, path, errors.Unwrap(err))
 	}
-	if ref.PassphraseEnv != "" {
-		pass, ok := env(ref.PassphraseEnv)
+	if c.PassphraseEnv != "" {
+		pass, ok := env(c.PassphraseEnv)
 		if !ok {
-			return nil, nil, domain.Fail(domain.CatAuthFailed, "credential %q: environment variable %s is not set", ref.Name, ref.PassphraseEnv)
+			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: environment variable %s is not set", c.Name, c.PassphraseEnv)
 		}
+		a.Secrets = append(a.Secrets, pass)
 		s, err := ssh.ParsePrivateKeyWithPassphrase(data, []byte(pass))
 		if err != nil {
-			return nil, nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot decrypt private key", ref.Name)
+			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot decrypt private key", c.Name)
 		}
-		return s, []string{pass}, nil
+		return s, nil
 	}
 	s, err := ssh.ParsePrivateKey(data)
 	if err != nil {
 		var missing *ssh.PassphraseMissingError
 		if errors.As(err, &missing) {
-			return nil, nil, domain.Fail(domain.CatAuthFailed, "credential %q: private key is encrypted but passphrase_env is not set", ref.Name)
+			return nil, domain.Fail(domain.CatAuthFailed, "credential %q: key is encrypted but passphrase_env is not set", c.Name)
 		}
-		return nil, nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot parse private key", ref.Name)
+		return nil, domain.Fail(domain.CatAuthFailed, "credential %q: cannot parse private key", c.Name)
 	}
-	return s, nil, nil
+	return s, nil
 }
 
 // ExpandHome expands a leading "~/".
@@ -121,24 +106,17 @@ func ExpandHome(p string) string {
 	return p
 }
 
-// MinSecretLen is the minimum length of a value the redactor will scrub.
-// Shorter values would mangle unrelated output; such secrets are too weak anyway.
+// MinSecretLen is the shortest value the redactor scrubs; shorter values
+// would mangle unrelated output (and are too weak to be real secrets).
 const MinSecretLen = 3
 
-// Redactor replaces known secret values with [REDACTED]. It is safe for concurrent use.
+// Redactor replaces known secrets with [REDACTED]. Safe for concurrent use.
 type Redactor struct {
 	mu      sync.RWMutex
 	secrets []string
 }
 
-// NewRedactor returns a redactor seeded with secrets.
-func NewRedactor(secrets ...string) *Redactor {
-	r := &Redactor{}
-	r.Add(secrets...)
-	return r
-}
-
-// Add registers additional secrets.
+// Add registers secrets.
 func (r *Redactor) Add(secrets ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -153,36 +131,10 @@ func (r *Redactor) Add(secrets ...string) {
 
 // String returns s with every registered secret replaced.
 func (r *Redactor) String(s string) string {
-	if r == nil {
-		return s
-	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, sec := range r.secrets {
-		if strings.Contains(s, sec) {
-			s = strings.ReplaceAll(s, sec, "[REDACTED]")
-		}
+		s = strings.ReplaceAll(s, sec, "[REDACTED]")
 	}
 	return s
-}
-
-// Error returns a redacted error message.
-func (r *Redactor) Error(err error) string {
-	if err == nil {
-		return ""
-	}
-	return r.String(err.Error())
-}
-
-// Failure redacts a failure's reason.
-func (r *Redactor) Failure(f *domain.Failure) *domain.Failure {
-	if f == nil {
-		return nil
-	}
-	return &domain.Failure{Category: f.Category, Reason: r.String(f.Reason)}
-}
-
-// Describe renders a credential reference for display without secrets.
-func Describe(ref domain.CredentialRef) string {
-	return fmt.Sprintf("%s(%s)", ref.Name, ref.Type)
 }

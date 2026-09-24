@@ -1,0 +1,6 @@
+# Managed by remote-command-orchestrator. Local changes will be overwritten.
+server {{ .ntp_server }} iburst prefer
+pool {{ .ntp_pool }} iburst
+driftfile /var/lib/chrony/chrony.drift
+makestep 1.0 3
+rtcsync

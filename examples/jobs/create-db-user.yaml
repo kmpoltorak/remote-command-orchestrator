@@ -1,0 +1,25 @@
+name: create-db-user
+description: Sensitive variables (pass with --var-env, never on the command line)
+version: "1.0"
+
+variables:
+  db_user:
+    required: true
+  db_password:
+    required: true
+    sensitive: true     # must be supplied via --var-env db_password=DB_PASSWORD
+
+defaults:
+  sudo: true
+
+steps:
+  - name: create-user
+    sensitive: true     # command and output are masked in every report
+    command: >-
+      runuser -u postgres -- psql -v ON_ERROR_STOP=1
+      -c "CREATE ROLE {{ .db_user }} LOGIN PASSWORD '{{ .db_password }}'"
+
+  - name: check-user
+    command: runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ .db_user }}'"
+    expect:
+      contains: "1"

@@ -1,0 +1,38 @@
+name: configure-ntp
+description: Install chrony, push its config from a template and restart it
+version: "1.2"
+
+variables:
+  ntp_server:
+    required: true
+    description: Upstream NTP server
+  ntp_pool:
+    default: pool.ntp.org
+
+defaults:
+  timeout: 60s
+  sudo: true            # every step runs through sudo
+
+steps:
+  - name: install-chrony
+    command: DEBIAN_FRONTEND=noninteractive apt-get install -y chrony
+    timeout: 5m
+    retries: 2
+    retry_delay: 10s
+
+  - name: upload-config
+    copy:
+      src: files/chrony.conf.tmpl
+      dest: /etc/chrony/chrony.conf
+      mode: "0644"
+      template: true    # {{ .ntp_server }} is rendered per host
+
+  - name: restart
+    script: scripts/restart-chrony.sh
+
+  - name: verify
+    sudo: false
+    command: chronyc -n sources
+    expect:
+      contains: "{{ .ntp_server }}"
+      not_contains: "503 No such source"
