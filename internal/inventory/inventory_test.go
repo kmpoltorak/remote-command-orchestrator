@@ -135,17 +135,17 @@ func TestFiltering(t *testing.T) {
 
 func TestInvalidInventories(t *testing.T) {
 	cases := map[string]string{
-		"duplicate host":      "hosts: [{name: a, address: x, credential: c}, {name: a, address: y, credential: c}]\ncredentials: {c: {type: agent, username: u}}",
-		"missing address":     "hosts: [{name: a}]",
-		"unknown credential":  "hosts: [{name: a, address: x, username: u, credential: nope}]",
-		"plaintext password":  "credentials: {c: {type: password, username: u, password: hunter2}}\nhosts: [{name: a, address: x, credential: c}]",
+		"duplicate host":       "hosts: [{name: a, address: x, credential: c}, {name: a, address: y, credential: c}]\ncredentials: {c: {type: agent, username: u}}",
+		"missing address":      "hosts: [{name: a}]",
+		"unknown credential":   "hosts: [{name: a, address: x, username: u, credential: nope}]",
+		"plaintext password":   "credentials: {c: {type: password, username: u, password: hunter2}}\nhosts: [{name: a, address: x, credential: c}]",
 		"password without env": "credentials: {c: {type: password, username: u}}\nhosts: [{name: a, address: x, credential: c}]",
-		"unknown bastion":     "hosts: [{name: a, address: x, username: u, bastion: nope}]",
-		"unknown profile":     "hosts: [{name: a, address: x, username: u, profile: nope}]",
-		"bad port":            "hosts: [{name: a, address: x, username: u, port: 70000}]",
-		"no username":         "hosts: [{name: a, address: x}]",
-		"newline variable":    "hosts: [{name: a, address: x, username: u, variables: {d: \"a\\nb\"}}]",
-		"bad profile regex":   "profiles: {p: {prompt_regex: '(['}}\nhosts: [{name: a, address: x, username: u, profile: p}]",
+		"unknown bastion":      "hosts: [{name: a, address: x, username: u, bastion: nope}]",
+		"unknown profile":      "hosts: [{name: a, address: x, username: u, profile: nope}]",
+		"bad port":             "hosts: [{name: a, address: x, username: u, port: 70000}]",
+		"no username":          "hosts: [{name: a, address: x}]",
+		"newline variable":     "hosts: [{name: a, address: x, username: u, variables: {d: \"a\\nb\"}}]",
+		"bad profile regex":    "profiles: {p: {prompt_regex: '(['}}\nhosts: [{name: a, address: x, username: u, profile: p}]",
 	}
 	for name, doc := range cases {
 		if _, err := Parse([]byte(doc)); err == nil {

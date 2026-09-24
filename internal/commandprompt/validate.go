@@ -123,7 +123,9 @@ func (p *Prompt) Validate() error {
 
 type validator struct{ issues []string }
 
-func (v *validator) add(format string, a ...any) { v.issues = append(v.issues, fmt.Sprintf(format, a...)) }
+func (v *validator) add(format string, a ...any) {
+	v.issues = append(v.issues, fmt.Sprintf(format, a...))
+}
 
 func (v *validator) dur(field string, d time.Duration) {
 	if d < 0 || d > MaxTimeout {

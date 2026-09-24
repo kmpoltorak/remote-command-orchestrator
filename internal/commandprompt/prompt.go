@@ -90,18 +90,18 @@ type Rollback struct {
 
 // Step is one command with its expectation.
 type Step struct {
-	Name            string        `yaml:"name" json:"name"`
-	Description     string        `yaml:"description" json:"description,omitempty"`
-	Command         string        `yaml:"command" json:"command"`
-	When            *When         `yaml:"when" json:"when,omitempty"`
-	Expect          Expect        `yaml:"expect" json:"expect"`
-	Timeout         time.Duration `yaml:"timeout" json:"timeout,omitempty"`
-	ExpectTimeout   time.Duration `yaml:"expect_timeout" json:"expect_timeout,omitempty"`
-	Retries         *int          `yaml:"retries" json:"retries,omitempty"`
-	RetryDelay      time.Duration `yaml:"retry_delay" json:"retry_delay,omitempty"`
-	ContinueOnError bool          `yaml:"continue_on_error" json:"continue_on_error,omitempty"`
-	SendNewline     *bool         `yaml:"send_newline" json:"send_newline,omitempty"`
-	Sensitive       bool          `yaml:"sensitive" json:"sensitive,omitempty"`
+	Name            string         `yaml:"name" json:"name"`
+	Description     string         `yaml:"description" json:"description,omitempty"`
+	Command         string         `yaml:"command" json:"command"`
+	When            *When          `yaml:"when" json:"when,omitempty"`
+	Expect          Expect         `yaml:"expect" json:"expect"`
+	Timeout         time.Duration  `yaml:"timeout" json:"timeout,omitempty"`
+	ExpectTimeout   time.Duration  `yaml:"expect_timeout" json:"expect_timeout,omitempty"`
+	Retries         *int           `yaml:"retries" json:"retries,omitempty"`
+	RetryDelay      time.Duration  `yaml:"retry_delay" json:"retry_delay,omitempty"`
+	ContinueOnError bool           `yaml:"continue_on_error" json:"continue_on_error,omitempty"`
+	SendNewline     *bool          `yaml:"send_newline" json:"send_newline,omitempty"`
+	Sensitive       bool           `yaml:"sensitive" json:"sensitive,omitempty"`
 	DelayAfter      *time.Duration `yaml:"delay_after" json:"delay_after,omitempty"`
 }
 
