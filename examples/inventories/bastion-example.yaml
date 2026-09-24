@@ -1,0 +1,33 @@
+# Hosts reachable only through an SSH bastion (jump host).
+# Tunnelling is native Go (x/crypto/ssh); no external ssh binary is used.
+credentials:
+  bastion-key:
+    type: private_key
+    username: automation
+    key_file: ~/.ssh/bastion_ed25519
+  internal-key:
+    type: private_key
+    username: automation
+    key_file: ~/.ssh/internal_ed25519
+
+bastions:
+  corp-bastion:
+    address: bastion.example.com
+    port: 22
+    username: automation
+    credential: bastion-key
+
+defaults:
+  credential: internal-key
+
+hosts:
+  - name: internal-router
+    address: 10.50.1.1
+    bastion: corp-bastion
+    profile: cisco_ios
+    tags: [internal]
+  - name: internal-linux
+    address: 10.50.2.10
+    bastion: corp-bastion
+    profile: linux
+    tags: [internal]

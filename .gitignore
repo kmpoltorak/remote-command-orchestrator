@@ -1,0 +1,16 @@
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+.env
+*.pem
+id_*
+!id_*.pub
+.DS_Store
+.idea/
+.vscode/
+
+# Local-only planning files
+/prompt.md
+/IMPLEMENTATION_PLAN.md

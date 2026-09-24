@@ -1,0 +1,45 @@
+# Linux hosts. Credentials are references only: no secrets in this file.
+credentials:
+  deploy-key:
+    type: private_key
+    username: deploy
+    key_file: ~/.ssh/deploy_ed25519
+  deploy-key-encrypted:
+    type: private_key
+    username: deploy
+    key_file: ~/.ssh/deploy_rsa
+    passphrase_env: DEPLOY_KEY_PASSPHRASE
+  ops-agent:
+    type: agent               # keys served by ssh-agent (SSH_AUTH_SOCK)
+    username: ops
+
+defaults:
+  port: 22
+  profile: linux
+  credential: deploy-key
+
+groups:
+  web:
+    defaults:
+      tags: [production, web]
+    hosts:
+      - name: web-01
+        address: 10.20.1.10
+      - name: web-02
+        address: 10.20.1.11
+
+  batch:
+    defaults:
+      credential: deploy-key-encrypted
+      tags: [staging]
+    hosts:
+      - name: batch-01
+        address: 10.20.2.10
+        port: 2222
+
+  agent-managed:
+    defaults:
+      credential: ops-agent
+    hosts:
+      - name: tools-01
+        address: tools-01.internal.example.com

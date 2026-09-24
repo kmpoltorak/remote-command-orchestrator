@@ -1,0 +1,67 @@
+# Network devices using interactive sessions.
+credentials:
+  network-prod:
+    type: private_key
+    username: automation
+    key_file: ~/.ssh/network-prod
+  legacy-switch:
+    type: password
+    username: admin
+    password_env: LEGACY_SWITCH_PASSWORD
+
+profiles:
+  # Custom profile overlaying the builtin cisco_ios profile.
+  cisco_ios:
+    login_timeout: 20s
+    setup_commands:
+      - terminal length 0
+
+groups:
+  routers:
+    defaults:
+      port: 22
+      username: automation
+      credential: network-prod
+      profile: cisco_ios
+      tags: [production]
+    hosts:
+      - name: router-01
+        address: 10.10.1.1
+        variables:
+          interface: GigabitEthernet0/1
+          description: CORE-UPLINK
+          previous_description: OLD-CORE-UPLINK
+      - name: router-02
+        address: 10.10.1.2
+        variables:
+          interface: GigabitEthernet0/2
+          description: BACKUP-UPLINK
+          previous_description: OLD-BACKUP-UPLINK
+
+  nexus:
+    defaults:
+      credential: network-prod
+      profile: cisco_nxos
+      tags: [production, datacenter]
+    hosts:
+      - name: nexus-01
+        address: 10.10.2.1
+
+  junos:
+    defaults:
+      credential: network-prod
+      profile: juniper_junos
+    hosts:
+      - name: mx-01
+        address: 10.10.3.1
+
+  legacy:
+    defaults:
+      credential: legacy-switch
+      profile: generic_network_device
+      tags: [legacy]
+    hosts:
+      - name: switch-legacy-01
+        address: 10.10.9.1
+        variables_env:
+          enable_password: LEGACY_ENABLE_PASSWORD

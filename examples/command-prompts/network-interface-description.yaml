@@ -1,0 +1,53 @@
+name: configure-interface-description
+description: Configure an interface description on network devices
+version: "1.0"
+
+session:
+  mode: interactive
+  profile: cisco_ios
+
+defaults:
+  command_timeout: 10s
+  expect_timeout: 5s
+
+variables:
+  interface:
+    required: true
+    description: Interface name, e.g. GigabitEthernet0/1
+  description:
+    required: true
+    description: New interface description
+
+steps:
+  - name: enter-configuration-mode
+    command: configure terminal
+    expect:
+      regex: '\(config\)#\s*$'
+
+  - name: select-interface
+    command: "interface {{ .interface }}"
+    expect:
+      regex: '\(config-if\)#\s*$'
+
+  - name: configure-description
+    command: "description {{ .description }}"
+    expect:
+      regex: '\(config-if\)#\s*$'
+      not_contains: "Invalid input"
+
+  - name: exit-interface
+    command: exit
+    expect:
+      regex: '\(config\)#\s*$'
+
+  - name: exit
+    command: end
+    expect:
+      regex: '#\s*$'
+
+  - name: save-configuration
+    command: write memory
+    retries: 2
+    retry_delay: 2s
+    expect:
+      contains: "OK"
