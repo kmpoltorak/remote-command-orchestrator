@@ -143,28 +143,30 @@ steps:
 	if err != nil {
 		t.Fatal(err)
 	}
-	acts, err := j.Build(map[string]string{"srv": "ntp1", "pw": "hunter2"}, Settings{Timeout: 30 * time.Second}, true)
+	acts, err := j.Build(map[string]string{"srv": "ntp1", "pw": "hunter2"}, Settings{Timeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a := acts[0]; a.Command != "echo 'ntp1'" || a.Sudo || a.Timeout != 5*time.Second || a.Retries != 2 {
+	if a := acts[0]; a.Remote("", true) != "echo 'ntp1'" || a.Sudo || a.Timeout != 5*time.Second || a.Retries != 2 {
 		t.Fatalf("cmd: %+v", a)
 	}
-	if a := acts[1]; a.Command != `sudo -S -p '' -- sh -c 'systemctl restart x'` || a.Timeout != time.Minute {
-		t.Fatalf("sudo: %+v", a)
+	if a := acts[1]; a.Remote("", true) != `sudo -k -S -p '' -- sh -c 'systemctl restart x'` || a.Timeout != time.Minute {
+		t.Fatalf("sudo: %q", a.Remote("", true))
 	}
-	if a := acts[2]; a.Command != "sudo -S -p '' -- bash -s" || !strings.HasPrefix(string(a.Stdin), "export pw='hunter2'\nexport srv='ntp1'\necho hi") {
-		t.Fatalf("script: %q %q", a.Command, a.Stdin)
+	if got := acts[1].Remote("", false); got != `sudo -n -- sh -c 'systemctl restart x'` {
+		t.Fatalf("NOPASSWD sudo: %q", got)
 	}
-	if a := acts[3]; string(a.Stdin) != "server ntp1\n" || !strings.Contains(a.Command, `'\''/etc/x y.conf.rco-tmp'\''`) || !strings.Contains(a.Display, "mode 0644") {
-		t.Fatalf("copy: %+v", a)
+	if a := acts[2]; a.Remote("/tmp/t", true) != `sudo -k -S -p '' -- sh -c 'bash '\''/tmp/t'\'''; rc=$?; rm -f '/tmp/t'; exit $rc` ||
+		!strings.HasPrefix(string(a.Content), "export pw='hunter2'\nexport srv='ntp1'\necho hi") {
+		t.Fatalf("script: %q %q", a.Remote("/tmp/t", true), a.Content)
+	}
+	a := acts[3]
+	if string(a.Content) != "server ntp1\n" || a.Mode != "0644" || !strings.Contains(a.Display, "mode 0644") ||
+		!strings.Contains(a.Remote("/tmp/t", false), `mv -f '\''/etc/x y.conf.rco-tmp'\'' '\''/etc/x y.conf'\''`) {
+		t.Fatalf("copy: %q", a.Remote("/tmp/t", false))
 	}
 	if a := acts[4]; a.Display != "[SENSITIVE]" {
 		t.Fatalf("sensitive display leaked: %q", a.Display)
-	}
-	acts, _ = j.Build(map[string]string{"srv": "x", "pw": "y"}, Settings{}, false)
-	if !strings.HasPrefix(acts[1].Command, "sudo -n -- ") {
-		t.Fatalf("NOPASSWD sudo: %q", acts[1].Command)
 	}
 }
 

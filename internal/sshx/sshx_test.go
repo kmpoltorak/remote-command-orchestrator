@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -20,22 +19,20 @@ import (
 	"github.com/kmpoltorak/remote-command-orchestrator/internal/sshtest"
 )
 
-var promptRe = regexp.MustCompile(`[\w.\-@/:()]+[>#]\s*$`)
-
-func dialer(t *testing.T, known string) *Dialer {
-	return &Dialer{
-		ConnectTimeout:   2 * time.Second,
-		HandshakeTimeout: 2 * time.Second,
-		HostKeys:         &HostKeys{Path: known, Logger: slog.Default()},
-	}
+func dialer(known string) *Dialer {
+	return &Dialer{ConnectTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
+		HostKeys: &HostKeys{Path: known, Logger: slog.Default()}}
 }
 
 func category(err error) domain.Category { return domain.AsFailure(err).Category }
 
-func connect(t *testing.T, srv *sshtest.Server) *Client {
+func hop(s *sshtest.Server, pw string) Hop {
+	return Hop{Addr: s.Addr, User: "deploy", Methods: []ssh.AuthMethod{ssh.Password(pw)}}
+}
+
+func connect(t *testing.T, s *sshtest.Server) *Client {
 	t.Helper()
-	d := dialer(t, srv.WriteKnownHosts(t))
-	c, err := d.Dial(context.Background(), Hop{Addr: srv.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("pw")}}, nil, nil)
+	c, err := dialer(sshtest.WriteKnownHosts(t, s)).Dial(context.Background(), hop(s, "pw"), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,66 +40,51 @@ func connect(t *testing.T, srv *sshtest.Server) *Client {
 	return c
 }
 
-func shellOpts() ShellOptions {
-	return ShellOptions{PTY: true, Prompt: promptRe, LineEnding: "\n", PagerPatterns: []string{"--More--"}, MaxOutput: 1 << 20, LoginTimeout: 2 * time.Second, PromptSettle: 100 * time.Millisecond}
+func run(t *testing.T, c *Client, cmd string, stdin string) (Result, error) {
+	t.Helper()
+	return Exec(context.Background(), c.Client, Request{Command: cmd, Stdin: []byte(stdin), Timeout: 5 * time.Second, MaxOutput: 1 << 16})
 }
 
-func step(cmd, re string) StepSpec {
-	s := StepSpec{Command: cmd, SendNewline: true, CommandTimeout: 3 * time.Second, ExpectTimeout: 2 * time.Second}
-	if re != "" {
-		s.Regex = regexp.MustCompile(re)
-	}
-	return s
-}
-
-func TestPasswordAndKeyAuth(t *testing.T) {
+func TestAuth(t *testing.T) {
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	signer, _ := ssh.NewSignerFromKey(priv)
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw", AuthorizedKey: signer.PublicKey()})
-	d := dialer(t, srv.WriteKnownHosts(t))
+	d := dialer(sshtest.WriteKnownHosts(t, srv))
 	ctx := context.Background()
-
-	c, err := d.Dial(ctx, Hop{Addr: srv.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.PublicKeys(signer)}}, nil, nil)
+	c, err := d.Dial(ctx, Hop{Addr: srv.Addr, User: "deploy", Methods: []ssh.AuthMethod{ssh.PublicKeys(signer)}}, nil, nil)
 	if err != nil {
 		t.Fatalf("key auth: %v", err)
 	}
 	c.Close()
-
-	_, err = d.Dial(ctx, Hop{Addr: srv.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("wrong")}}, nil, nil)
-	if category(err) != domain.CatAuthFailed {
-		t.Fatalf("want AUTH_FAILED, got %v", err)
+	c, err = d.Dial(ctx, hop(srv, "pw"), nil, nil)
+	if err != nil {
+		t.Fatalf("password auth: %v", err)
 	}
-	if strings.Contains(err.Error(), "wrong") {
-		t.Fatal("password leaked in error")
+	c.Close()
+	_, err = d.Dial(ctx, hop(srv, "wrong-password"), nil, nil)
+	if category(err) != domain.CatAuthFailed || strings.Contains(err.Error(), "wrong-password") {
+		t.Fatalf("want AUTH_FAILED without leak, got %v", err)
 	}
 }
 
 func TestHostKeyVerification(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	other := sshtest.Start(t, sshtest.Options{Password: "pw"})
-	// known_hosts contains other's key under srv's address -> mismatch.
-	known := filepath.Join(t.TempDir(), "known_hosts")
 	_, port, _ := net.SplitHostPort(srv.Addr)
-	os.WriteFile(known, []byte("[127.0.0.1]:"+port+" "+string(ssh.MarshalAuthorizedKey(other.HostKey.PublicKey()))), 0o600)
-	hop := Hop{Addr: srv.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("pw")}}
-
-	_, err := dialer(t, known).Dial(context.Background(), hop, nil, nil)
-	if category(err) != domain.CatHostKeyMismatch {
-		t.Fatalf("want HOST_KEY_MISMATCH, got %v", err)
-	}
+	mismatch := filepath.Join(t.TempDir(), "kh")
+	os.WriteFile(mismatch, []byte("[127.0.0.1]:"+port+" "+string(ssh.MarshalAuthorizedKey(other.HostKey.PublicKey()))), 0o600)
 	empty := filepath.Join(t.TempDir(), "empty")
 	os.WriteFile(empty, nil, 0o600)
-	_, err = dialer(t, empty).Dial(context.Background(), hop, nil, nil)
-	if category(err) != domain.CatHostKeyUnknown {
-		t.Fatalf("want HOST_KEY_UNKNOWN, got %v", err)
+
+	cases := map[string]domain.Category{mismatch: domain.CatHostKeyMismatch, empty: domain.CatHostKeyUnknown, "/nonexistent/kh": domain.CatHostKeyUnknown}
+	for path, want := range cases {
+		if _, err := dialer(path).Dial(context.Background(), hop(srv, "pw"), nil, nil); category(err) != want {
+			t.Errorf("%s: want %s, got %v", path, want, err)
+		}
 	}
-	_, err = dialer(t, "/nonexistent/known_hosts").Dial(context.Background(), hop, nil, nil)
-	if category(err) != domain.CatHostKeyUnknown {
-		t.Fatalf("missing known_hosts must fail closed, got %v", err)
-	}
-	d := dialer(t, empty)
+	d := dialer(empty)
 	d.HostKeys.Insecure = true
-	c, err := d.Dial(context.Background(), hop, nil, nil)
+	c, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil)
 	if err != nil {
 		t.Fatalf("insecure mode: %v", err)
 	}
@@ -110,17 +92,15 @@ func TestHostKeyVerification(t *testing.T) {
 }
 
 func TestConnectionFailures(t *testing.T) {
-	d := dialer(t, "/dev/null")
-	// Refused: listen then close to get a free port.
+	d := dialer("/dev/null")
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	addr := ln.Addr().String()
+	closed := ln.Addr().String()
 	ln.Close()
-	_, err := d.Dial(context.Background(), Hop{Addr: addr, User: "x"}, nil, nil)
-	if category(err) != domain.CatConnectionRefused {
+	if _, err := d.Dial(context.Background(), Hop{Addr: closed}, nil, nil); category(err) != domain.CatConnectionRefused {
 		t.Fatalf("want CONNECTION_REFUSED, got %v", err)
 	}
-	// Handshake timeout: a listener that accepts but never speaks SSH.
-	silent, _ := net.Listen("tcp", "127.0.0.1:0")
+
+	silent, _ := net.Listen("tcp", "127.0.0.1:0") // accepts TCP, never speaks SSH
 	defer silent.Close()
 	go func() {
 		for {
@@ -133,257 +113,138 @@ func TestConnectionFailures(t *testing.T) {
 	}()
 	d.HandshakeTimeout = 300 * time.Millisecond
 	start := time.Now()
-	_, err = d.Dial(context.Background(), Hop{Addr: silent.Addr().String(), User: "x"}, nil, nil)
-	if category(err) != domain.CatHandshakeFailed || time.Since(start) > 2*time.Second {
+	if _, err := d.Dial(context.Background(), Hop{Addr: silent.Addr().String()}, nil, nil); category(err) != domain.CatHandshakeFailed || time.Since(start) > 2*time.Second {
 		t.Fatalf("want fast SSH_HANDSHAKE_FAILED, got %v after %s", err, time.Since(start))
 	}
-	// Connect timeout via context deadline on a non-routable address.
+
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err = d.Dial(ctx, Hop{Addr: "10.255.255.1:22", User: "x"}, nil, nil)
-	if c := category(err); c != domain.CatConnectionTimeout {
+	if _, err := d.Dial(ctx, Hop{Addr: "10.255.255.1:22"}, nil, nil); category(err) != domain.CatConnectionTimeout {
 		t.Fatalf("want CONNECTION_TIMEOUT, got %v", err)
 	}
-	// DNS failure.
-	_, err = d.Dial(context.Background(), Hop{Addr: "no-such-host.invalid:22", User: "x"}, nil, nil)
-	if c := category(err); c != domain.CatDNSFailure {
+	if _, err := d.Dial(context.Background(), Hop{Addr: "no-such-host.invalid:22"}, nil, nil); category(err) != domain.CatDNSFailure {
 		t.Fatalf("want DNS_FAILURE, got %v", err)
 	}
 }
 
-func TestSessionFailure(t *testing.T) {
-	srv := sshtest.Start(t, sshtest.Options{Password: "pw", RejectSessions: true})
-	c := connect(t, srv)
-	_, _, err := OpenShell(context.Background(), c.Client, shellOpts())
-	if category(err) != domain.CatSessionFailed {
-		t.Fatalf("want SESSION_FAILED, got %v", err)
-	}
-	_, err = Exec(context.Background(), c.Client, step("hostname", ""), 4096)
-	if category(err) != domain.CatSessionFailed {
-		t.Fatalf("want SESSION_FAILED, got %v", err)
-	}
-}
-
-func TestInteractiveWorkflow(t *testing.T) {
-	srv := sshtest.Start(t, sshtest.Options{Password: "pw", Banner: "Authorized access only"})
-	c := connect(t, srv)
-	sh, banner, err := OpenShell(context.Background(), c.Client, shellOpts())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sh.Close()
-	if !strings.Contains(banner, "Authorized access only") {
-		t.Fatalf("banner %q", banner)
-	}
-	ctx := context.Background()
-	for _, s := range []StepSpec{
-		step("configure terminal", `\(config\)#\s*$`),
-		step("interface Gi0/1", `\(config-if\)#\s*$`),
-		step("description TEST", `\(config-if\)#\s*$`),
-		step("end", `[^)]#\s*$`),
-	} {
-		out, err := sh.Run(ctx, s)
-		if err != nil {
-			t.Fatalf("%s: %v (%+v)", s.Command, err, out)
-		}
-	}
-	if srv.Description("Gi0/1") != "TEST" {
-		t.Fatal("description not applied")
-	}
-	// Echo removed, output normalized, prompt captured separately.
-	out, err := sh.Run(ctx, step("show version", ""))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(out.Output, "show version") || !strings.HasPrefix(out.Output, "Cisco IOS") || out.MatchedPrompt != "router#" {
-		t.Fatalf("normalization: %+v", out)
-	}
-	// Session reuse: one connection, one session for all steps.
-	if srv.Conns.Load() != 1 || srv.Sessions.Load() != 1 {
-		t.Fatalf("conns=%d sessions=%d", srv.Conns.Load(), srv.Sessions.Load())
-	}
-}
-
-func TestExpectFailures(t *testing.T) {
+func TestExec(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	c := connect(t, srv)
-	sh, _, err := OpenShell(context.Background(), c.Client, shellOpts())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sh.Close()
-	ctx := context.Background()
 
-	// Prompt mismatch: expect config-if, device is in (config).
-	out, err := sh.Run(ctx, step("configure terminal", `\(config-if\)#\s*$`))
-	if category(err) != domain.CatPromptMismatch || out.MatchedPrompt != "router(config)#" {
-		t.Fatalf("want PROMPT_MISMATCH with received prompt, got %v %+v", err, out)
+	r, err := run(t, c, "echo hello; echo oops >&2", "")
+	if err != nil || r.Stdout != "hello" || r.Stderr != "oops" || *r.ExitCode != 0 {
+		t.Fatalf("%v %+v", err, r)
 	}
-	sh.Run(ctx, step("end", ""))
-
-	// not_contains triggers COMMAND_FAILED; echo is excluded from matching.
-	s := step("bogus Invalid", "")
-	s.NotContains = []string{"Invalid input"}
-	if _, err := sh.Run(ctx, s); category(err) != domain.CatCommandFailed {
-		t.Fatalf("want COMMAND_FAILED, got %v", err)
+	r, err = run(t, c, "exit 3", "")
+	if err != nil || *r.ExitCode != 3 {
+		t.Fatalf("non-zero exit is a result, not an error: %v %+v", err, r)
 	}
-	s = step("show version", "")
-	s.NotContains = []string{"show version"} // only in the echo
-	s.Contains = []string{"Cisco"}
-	if _, err := sh.Run(ctx, s); err != nil {
-		t.Fatalf("echo must not count for matching: %v", err)
+	r, err = run(t, c, "sh -s", "X=from-stdin\necho $X\n")
+	if err != nil || r.Stdout != "from-stdin" {
+		t.Fatalf("script via stdin: %v %+v", err, r)
 	}
-
-	// Expect timeout: device goes silent.
-	s = step("sleep 2s", "")
-	s.ExpectTimeout = 300 * time.Millisecond
-	if _, err := sh.Run(ctx, s); category(err) != domain.CatExpectTimeout {
-		t.Fatalf("want EXPECT_TIMEOUT, got %v", err)
+	r, _ = run(t, c, "cat", "") // must see EOF, not hang
+	if *r.ExitCode != 0 {
+		t.Fatalf("%+v", r)
 	}
-	time.Sleep(2 * time.Second) // let the device return to the prompt
-
-	// Command (hard) timeout: steady output keeps the idle timer alive.
-	s = step("trickle", "")
-	s.CommandTimeout = 500 * time.Millisecond
-	if _, err := sh.Run(ctx, s); category(err) != domain.CatCommandTimeout {
-		t.Fatalf("want COMMAND_TIMEOUT, got %v", err)
+	if srv.Conns.Load() != 1 || srv.Sessions.Load() != 4 {
+		t.Fatalf("commands must share one connection: conns=%d sessions=%d", srv.Conns.Load(), srv.Sessions.Load())
 	}
 }
 
-func TestPagerAndLimits(t *testing.T) {
+func TestExecTimeoutAndCancel(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	c := connect(t, srv)
-	sh, _, err := OpenShell(context.Background(), c.Client, shellOpts())
-	if err != nil {
-		t.Fatal(err)
+	start := time.Now()
+	_, err := Exec(context.Background(), c.Client, Request{Command: "sleep 10", Timeout: 300 * time.Millisecond, MaxOutput: 1024})
+	if category(err) != domain.CatCommandTimeout || time.Since(start) > 3*time.Second {
+		t.Fatalf("want COMMAND_TIMEOUT, got %v after %s", err, time.Since(start))
 	}
-	out, err := sh.Run(context.Background(), step("show long", `#\s*$`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.Output, "line 100") || strings.Contains(out.Output, "--More--") {
-		t.Fatalf("pager handling: %q", out.Output[len(out.Output)-200:])
-	}
-	sh.Close()
-
-	c2 := connect(t, srv)
-	o := shellOpts()
-	o.MaxPages = 5
-	sh2, _, _ := OpenShell(context.Background(), c2.Client, o)
-	defer sh2.Close()
-	if _, err := sh2.Run(context.Background(), step("show endless", "")); category(err) != domain.CatOutputLimitExceeded {
-		t.Fatalf("want OUTPUT_LIMIT_EXCEEDED, got %v", err)
-	}
-}
-
-func TestSessionDropAndCancel(t *testing.T) {
-	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
-	c := connect(t, srv)
-	sh, _, _ := OpenShell(context.Background(), c.Client, shellOpts())
-	if _, err := sh.Run(context.Background(), step("drop", "")); category(err) != domain.CatSessionFailed {
-		t.Fatalf("want SESSION_FAILED, got %v", err)
-	}
-	if sh.Alive() {
-		t.Fatal("shell should be dead")
-	}
-
-	c2 := connect(t, srv)
-	sh2, _, _ := OpenShell(context.Background(), c2.Client, shellOpts())
-	defer sh2.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(200*time.Millisecond, cancel)
-	start := time.Now()
-	if _, err := sh2.Run(ctx, step("hang", "")); category(err) != domain.CatCancelled || time.Since(start) > time.Second {
-		t.Fatalf("want fast CANCELLED, got %v", err)
+	if _, err := Exec(ctx, c.Client, Request{Command: "sleep 10", Timeout: time.Minute, MaxOutput: 1024}); category(err) != domain.CatCancelled {
+		t.Fatalf("want CANCELLED, got %v", err)
+	}
+	// The connection is still usable after a killed command.
+	if r, err := run(t, c, "echo ok", ""); err != nil || r.Stdout != "ok" {
+		t.Fatalf("%v %+v", err, r)
 	}
 }
 
-func TestExecMode(t *testing.T) {
-	srv := sshtest.Start(t, sshtest.Options{Password: "pw", Hostname: "app-01"})
+func TestExecOutputLimitAndPatterns(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	c := connect(t, srv)
-	ctx := context.Background()
-	out, err := Exec(ctx, c.Client, step("hostname", ""), 4096)
-	if err != nil || out.Output != "app-01" || *out.ExitCode != 0 {
-		t.Fatalf("%v %+v", err, out)
-	}
-	out, err = Exec(ctx, c.Client, step("fail", ""), 4096)
-	if category(err) != domain.CatCommandFailed || *out.ExitCode != 1 || !strings.Contains(out.Stderr, "boom") {
-		t.Fatalf("%v %+v", err, out)
-	}
-	three := 3
-	s := step("exit 3", "")
-	s.ExitCode = &three
-	if _, err := Exec(ctx, c.Client, s, 4096); err != nil {
+	// ~500 KB of output with a marker in the middle that will be dropped.
+	cmd := "i=0; while [ $i -lt 5000 ]; do echo line-$i-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; [ $i -eq 2500 ] && echo NEEDLE; i=$((i+1)); done"
+	r, err := Exec(context.Background(), c.Client, Request{Command: cmd, Timeout: 30 * time.Second, MaxOutput: 8192, Patterns: []string{"NEEDLE", "absent"}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	s = step("sleep 2s", "")
-	s.CommandTimeout = 200 * time.Millisecond
-	if _, err := Exec(ctx, c.Client, s, 4096); category(err) != domain.CatCommandTimeout {
-		t.Fatalf("want COMMAND_TIMEOUT, got %v", err)
+	if !r.Truncated || len(r.Stdout) > 8300 || strings.Contains(r.Stdout, "NEEDLE") {
+		t.Fatalf("truncated=%v len=%d", r.Truncated, len(r.Stdout))
 	}
-	out, err = Exec(ctx, c.Client, step("flood 10000", ""), 8192)
-	if err != nil || !out.Truncated || out.Bytes != 1_000_000 || len(out.Raw) > 8192+100 {
-		t.Fatalf("truncation: %v truncated=%v bytes=%d raw=%d", err, out.Truncated, out.Bytes, len(out.Raw))
+	if !r.Found(0) || r.Found(1) {
+		t.Fatal("streaming pattern search must see dropped output")
 	}
-	if srv.Conns.Load() != 1 {
-		t.Fatal("exec steps must share one connection")
+	if !strings.HasPrefix(r.Stdout, "line-0-") || !strings.Contains(r.Stdout, "line-4999-") {
+		t.Fatal("head and tail must be kept")
+	}
+}
+
+func TestSessionFailure(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "pw", RejectExec: true})
+	c := connect(t, srv)
+	if _, err := run(t, c, "true", ""); category(err) != domain.CatSessionFailed {
+		t.Fatalf("want SESSION_FAILED, got %v", err)
 	}
 }
 
 func TestBastion(t *testing.T) {
-	target := sshtest.Start(t, sshtest.Options{Password: "pw", Hostname: "internal"})
+	target := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	bastion := sshtest.Start(t, sshtest.Options{Password: "bpw", AllowForward: true})
-	known := filepath.Join(t.TempDir(), "known_hosts")
-	a, _ := os.ReadFile(target.WriteKnownHosts(t))
-	b, _ := os.ReadFile(bastion.WriteKnownHosts(t))
-	os.WriteFile(known, append(a, b...), 0o600)
-	d := dialer(t, known)
-	c, err := d.Dial(context.Background(),
-		Hop{Addr: target.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("pw")}},
-		&Hop{Addr: bastion.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("bpw")}}, nil)
+	d := dialer(sshtest.WriteKnownHosts(t, target, bastion))
+	b := hop(bastion, "bpw")
+	c, err := d.Dial(context.Background(), hop(target, "pw"), &b, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := Exec(context.Background(), c.Client, step("hostname", ""), 4096)
+	r, err := Exec(context.Background(), c.Client, Request{Command: "echo via-bastion", Timeout: 5 * time.Second, MaxOutput: 1024})
 	c.Close()
-	if err != nil || out.Output != "internal" {
-		t.Fatalf("%v %+v", err, out)
+	if err != nil || r.Stdout != "via-bastion" {
+		t.Fatalf("%v %+v", err, r)
 	}
-	if bastion.Conns.Load() != 1 || target.Conns.Load() != 1 {
-		t.Fatal("expected one bastion and one target connection")
+	if bastion.Conns.Load() != 1 || target.Conns.Load() != 1 || len(bastion.Commands()) != 0 {
+		t.Fatal("bastion must only tunnel")
 	}
-	// Bastion auth failure is reported with a bastion prefix.
-	_, err = d.Dial(context.Background(),
-		Hop{Addr: target.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("pw")}},
-		&Hop{Addr: bastion.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("bad")}}, nil)
-	if f := domain.AsFailure(err); f.Category != domain.CatAuthFailed || !strings.HasPrefix(f.Reason, "bastion") {
+	bad := hop(bastion, "nope")
+	if _, err = d.Dial(context.Background(), hop(target, "pw"), &bad, nil); category(err) != domain.CatAuthFailed || !strings.HasPrefix(domain.AsFailure(err).Reason, "bastion") {
 		t.Fatalf("got %v", err)
 	}
 }
 
 func TestNoGoroutineLeaks(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
-	d := dialer(t, srv.WriteKnownHosts(t))
-	before := runtime.NumGoroutine()
-	for i := 0; i < 20; i++ {
-		c, err := d.Dial(context.Background(), Hop{Addr: srv.Addr, User: "admin", Methods: []ssh.AuthMethod{ssh.Password("pw")}}, nil, nil)
+	d := dialer(sshtest.WriteKnownHosts(t, srv))
+	cycle := func() {
+		c, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sh, _, err := OpenShell(context.Background(), c.Client, shellOpts())
-		if err != nil {
-			t.Fatal(err)
-		}
-		sh.Run(context.Background(), step("show version", ""))
-		sh.Close()
+		Exec(context.Background(), c.Client, Request{Command: "echo x", Timeout: time.Second, MaxOutput: 1024})
+		Exec(context.Background(), c.Client, Request{Command: "sleep 5", Timeout: 50 * time.Millisecond, MaxOutput: 1024})
 		c.Close()
 	}
+	cycle() // warm up lazily started goroutines
+	time.Sleep(300 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	for range 10 {
+		cycle()
+	}
 	deadline := time.Now().Add(3 * time.Second)
-	for runtime.NumGoroutine() > before+5 && time.Now().Before(deadline) {
+	for runtime.NumGoroutine() > before+3 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
-	// The server side also runs goroutines in-process; allow small slack.
-	if g := runtime.NumGoroutine(); g > before+5 {
+	if g := runtime.NumGoroutine(); g > before+3 {
 		t.Fatalf("goroutine leak: before=%d after=%d", before, g)
 	}
 }

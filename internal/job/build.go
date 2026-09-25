@@ -10,13 +10,27 @@ import (
 	"github.com/kmpoltorak/remote-command-orchestrator/internal/domain"
 )
 
+// Step kinds.
+const (
+	KindCommand = "command"
+	KindScript  = "script"
+	KindCopy    = "copy"
+)
+
 // Action is one step made concrete for a host.
+//
+// Script and copy content is first uploaded, as the login user, to a private
+// temp file (see UploadCommand); Remote then runs against that file. This
+// keeps stdin of a sudo command reserved for the sudo password, so the
+// password can never leak into a script or a file when sudo does not prompt.
 type Action struct {
 	Name            string
-	Kind            string // command | script | copy
+	Kind            string
 	Display         string // what reports show; [SENSITIVE] for sensitive steps
-	Command         string // remote command line
-	Stdin           []byte // script / file content (never shown)
+	Shell           string // KindCommand: rendered command
+	Content         []byte // KindScript / KindCopy: bytes to upload (never shown)
+	Dest            string // KindCopy
+	Mode            string // KindCopy
 	Sudo            bool
 	ExitCode        int
 	Contains        []string
@@ -29,18 +43,52 @@ type Action struct {
 	Sensitive       bool
 }
 
+// UploadCommand stores stdin in a new 0600 temp file and prints its path.
+const UploadCommand = `umask 077 && t=$(mktemp) && cat > "$t" && printf '%s' "$t"`
+
+// Remote returns the command line to run. tmp is the uploaded temp file for
+// script/copy steps. sudoPassword selects sudo -S (password on stdin) or -n.
+func (a Action) Remote(tmp string, sudoPassword bool) string {
+	wrap := func(cmd string) string {
+		if !a.Sudo {
+			return cmd
+		}
+		if sudoPassword {
+			// -k ignores cached credentials so sudo always consumes the password line.
+			return "sudo -k -S -p '' -- sh -c " + Quote(cmd)
+		}
+		return "sudo -n -- sh -c " + Quote(cmd) // never hang on a password prompt
+	}
+	switch {
+	case a.Kind == KindScript:
+		return cleanup(wrap("bash "+Quote(tmp)), tmp)
+	case a.Kind == KindCommand && a.Content != nil: // sensitive command, see build
+		return cleanup(wrap("sh "+Quote(tmp)), tmp)
+	case a.Kind == KindCopy:
+		// Copy to a temp name beside dest, then rename: readers never see a
+		// partial file, and the file is owned by the (sudo) user doing the copy.
+		part := Quote(a.Dest + ".rco-tmp")
+		inner := fmt.Sprintf("cp %s %s && chmod %s %s && mv -f %s %s", Quote(tmp), part, a.Mode, part, part, Quote(a.Dest))
+		return cleanup(wrap(inner), tmp)
+	}
+	return wrap(a.Shell)
+}
+
+func cleanup(cmd, tmp string) string {
+	return fmt.Sprintf("%s; rc=$?; rm -f %s; exit $rc", cmd, Quote(tmp))
+}
+
 // Settings are CLI-level defaults the job file can override.
 type Settings struct {
 	Timeout    time.Duration
 	RetryDelay time.Duration
 }
 
-// Build renders every step for one host. sudoPassword reports whether a sudo
-// password will be written to stdin (sudo -S) or sudo must not prompt (-n).
-func (j *Job) Build(vars map[string]string, s Settings, sudoPassword bool) ([]Action, error) {
+// Build renders every step for one host.
+func (j *Job) Build(vars map[string]string, s Settings) ([]Action, error) {
 	out := make([]Action, 0, len(j.Steps))
 	for _, st := range j.Steps {
-		a, err := j.build(st, vars, s, sudoPassword)
+		a, err := j.build(st, vars, s)
 		if err != nil {
 			return nil, domain.Fail(domain.CatTemplateError, "step %q: %v", st.Name, err)
 		}
@@ -49,7 +97,7 @@ func (j *Job) Build(vars map[string]string, s Settings, sudoPassword bool) ([]Ac
 	return out, nil
 }
 
-func (j *Job) build(st Step, vars map[string]string, s Settings, sudoPassword bool) (Action, error) {
+func (j *Job) build(st Step, vars map[string]string, s Settings) (Action, error) {
 	a := Action{
 		Name:            st.Name,
 		Sudo:            j.Defaults.Sudo,
@@ -81,69 +129,44 @@ func (j *Job) build(st Step, vars map[string]string, s Settings, sudoPassword bo
 
 	switch {
 	case st.Command != "":
-		a.Kind = "command"
-		cmd, err := Render(st.Command, vars)
-		if err != nil {
+		a.Kind = KindCommand
+		if a.Shell, err = Render(st.Command, vars); err != nil {
 			return a, err
 		}
-		a.Display = cmd
-		a.Command = cmd
-		if a.Sudo {
-			a.Command = sudoPrefix(sudoPassword) + "sh -c " + Quote(cmd)
-		}
+		a.Display = a.Shell
 	case st.Script != "":
-		a.Kind = "script"
-		a.Display = "bash -s < " + st.Script
-		a.Command = "bash -s"
-		if a.Sudo {
-			a.Command = sudoPrefix(sudoPassword) + "bash -s"
-		}
-		// Variables are exported at the top of the script stream (stdin, so
-		// they never appear in the remote process list).
-		a.Stdin = append([]byte(exports(vars)), st.scriptBody...)
+		a.Kind = KindScript
+		a.Display = "script " + st.Script
+		// Job variables are exported at the top of the script.
+		a.Content = append([]byte(exports(vars)), st.scriptBody...)
 	case st.Copy != nil:
-		a.Kind = "copy"
-		dest, err := Render(st.Copy.Dest, vars)
-		if err != nil {
+		a.Kind = KindCopy
+		if a.Dest, err = Render(st.Copy.Dest, vars); err != nil {
 			return a, err
 		}
-		body := st.Copy.body
+		a.Content = st.Copy.body
 		if st.Copy.Template {
-			r, err := Render(string(body), vars)
+			r, err := Render(string(a.Content), vars)
 			if err != nil {
 				return a, err
 			}
-			body = []byte(r)
+			a.Content = []byte(r)
 		}
-		mode := st.Copy.Mode
-		if mode == "" {
-			mode = DefaultMode
+		a.Mode = st.Copy.Mode
+		if a.Mode == "" {
+			a.Mode = DefaultMode
 		}
-		a.Display = fmt.Sprintf("copy %s -> %s (mode %s)", st.Copy.Src, dest, mode)
-		a.Command = uploadCommand(dest, mode)
-		if a.Sudo {
-			a.Command = sudoPrefix(sudoPassword) + "sh -c " + Quote(a.Command)
-		}
-		a.Stdin = body
+		a.Display = fmt.Sprintf("copy %s -> %s (mode %s)", st.Copy.Src, a.Dest, a.Mode)
 	}
 	if a.Sensitive {
 		a.Display = domain.SensitiveMask
+		if a.Kind == KindCommand {
+			// Keep secrets out of the remote process list (ps): the command
+			// travels as file content instead of as an argument.
+			a.Content = []byte(a.Shell + "\n")
+		}
 	}
 	return a, nil
-}
-
-// uploadCommand writes stdin to a temp file next to dest and renames it into
-// place, so readers never observe a partially written file.
-func uploadCommand(dest, mode string) string {
-	tmp := Quote(dest + ".rco-tmp")
-	return fmt.Sprintf("umask 077 && cat > %s && chmod %s %s && mv -f %s %s", tmp, mode, tmp, tmp, Quote(dest))
-}
-
-func sudoPrefix(password bool) string {
-	if password {
-		return "sudo -S -p '' -- " // password is the first line of stdin
-	}
-	return "sudo -n -- " // never hang on a password prompt
 }
 
 func exports(vars map[string]string) string {

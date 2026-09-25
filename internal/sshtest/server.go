@@ -1,67 +1,62 @@
-// Package sshtest provides a deterministic in-process SSH server for tests.
-// It emulates a Cisco-IOS-like interactive CLI (prompt state machine, echo,
-// pagination, enable password) and Linux-like exec commands, and supports
-// bastion port forwarding (direct-tcpip).
+// Package sshtest runs a real SSH server in-process for tests. Exec requests
+// run through the local /bin/sh inside a private temp directory, so tests
+// exercise genuine commands, stdin, exit codes and timeouts. This is test
+// infrastructure only; the orchestrator itself never executes local shells.
 package sshtest
 
 import (
-	"bufio"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// Options configure a test server.
+// Options configure a server.
 type Options struct {
-	User           string // default "admin"
-	Password       string // enables password auth
-	AuthorizedKey  ssh.PublicKey
-	Hostname       string // default "router"
-	Banner         string
-	EnablePassword string
-	RejectSessions bool
-	AllowForward   bool
-	// FailDescription makes "description <value>" return an IOS error.
-	FailDescription string
+	User          string // default "deploy"
+	Password      string // enables password auth
+	AuthorizedKey ssh.PublicKey
+	SudoPassword  string // fake sudo requires this with -S; empty = NOPASSWD
+	AllowForward  bool   // act as a bastion (direct-tcpip)
+	RejectExec    bool   // accept sessions but refuse exec requests
 }
 
 // Server is a running test SSH server.
 type Server struct {
 	Addr    string
+	Dir     string // working directory and $HOME of every command
 	HostKey ssh.Signer
 	opts    Options
 	ln      net.Listener
+	binDir  string
 
-	Conns    atomic.Int64
+	Conns    atomic.Int64 // accepted, authenticated connections
 	Sessions atomic.Int64
-	Active   atomic.Int64 // currently open connections
 
 	mu       sync.Mutex
 	commands []string
-	descs    map[string]string
-	wg       sync.WaitGroup
+	running  atomic.Int64
+	peak     atomic.Int64
 }
 
-// Start launches a server on 127.0.0.1:0 and stops it at test cleanup.
+// Start launches a server on 127.0.0.1:0; it stops at test cleanup.
 func Start(t testing.TB, o Options) *Server {
 	t.Helper()
 	if o.User == "" {
-		o.User = "admin"
-	}
-	if o.Hostname == "" {
-		o.Hostname = "router"
+		o.User = "deploy"
 	}
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	signer, err := ssh.NewSignerFromKey(priv)
@@ -72,7 +67,10 @@ func Start(t testing.TB, o Options) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{Addr: ln.Addr().String(), HostKey: signer, opts: o, ln: ln, descs: map[string]string{}}
+	s := &Server{Addr: ln.Addr().String(), Dir: t.TempDir(), HostKey: signer, opts: o, ln: ln, binDir: t.TempDir()}
+	if err := os.WriteFile(filepath.Join(s.binDir, "sudo"), []byte(fakeSudo), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cfg := &ssh.ServerConfig{}
 	if o.Password != "" {
 		cfg.PasswordCallback = func(c ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
@@ -83,65 +81,56 @@ func Start(t testing.TB, o Options) *Server {
 		}
 	}
 	if o.AuthorizedKey != nil {
-		want := o.AuthorizedKey.Marshal()
+		want := string(o.AuthorizedKey.Marshal())
 		cfg.PublicKeyCallback = func(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
-			if c.User() == o.User && string(k.Marshal()) == string(want) {
+			if c.User() == o.User && string(k.Marshal()) == want {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("denied")
 		}
 	}
 	cfg.AddHostKey(signer)
-	s.wg.Add(1)
 	go func() {
-		defer s.wg.Done()
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			s.wg.Add(1)
-			go func() { defer s.wg.Done(); s.serve(c, cfg) }()
+			go s.serve(c, cfg)
 		}
 	}()
-	t.Cleanup(s.Close)
+	t.Cleanup(func() { _ = ln.Close() })
 	return s
 }
 
-// Close stops the listener.
-func (s *Server) Close() { _ = s.ln.Close() }
-
-// Commands returns every interactive/exec command received, in order.
+// Commands returns every exec command received, in order.
 func (s *Server) Commands() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string{}, s.commands...)
 }
 
-// Description returns the configured description of an interface.
-func (s *Server) Description(iface string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.descs[iface]
+// PeakConcurrent is the highest number of simultaneously running commands.
+func (s *Server) PeakConcurrent() int64 { return s.peak.Load() }
+
+// KnownHostsLine returns a known_hosts entry trusting this server.
+func (s *Server) KnownHostsLine() string {
+	_, port, _ := net.SplitHostPort(s.Addr)
+	return fmt.Sprintf("[127.0.0.1]:%s %s", port, ssh.MarshalAuthorizedKey(s.HostKey.PublicKey()))
 }
 
-// WriteKnownHosts writes a known_hosts file trusting this server.
-func (s *Server) WriteKnownHosts(t testing.TB) string {
+// WriteKnownHosts writes a known_hosts file trusting the given servers.
+func WriteKnownHosts(t testing.TB, servers ...*Server) string {
 	t.Helper()
+	var data []byte
+	for _, s := range servers {
+		data = append(data, s.KnownHostsLine()...)
+	}
 	p := filepath.Join(t.TempDir(), "known_hosts")
-	line := fmt.Sprintf("[127.0.0.1]:%s %s", s.port(), ssh.MarshalAuthorizedKey(s.HostKey.PublicKey()))
-	if err := os.WriteFile(p, []byte(line), 0o600); err != nil {
+	if err := os.WriteFile(p, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return p
-}
-
-func (s *Server) port() string { _, p, _ := net.SplitHostPort(s.Addr); return p }
-
-func (s *Server) record(cmd string) {
-	s.mu.Lock()
-	s.commands = append(s.commands, cmd)
-	s.mu.Unlock()
 }
 
 func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
@@ -152,16 +141,10 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 	}
 	defer sc.Close()
 	s.Conns.Add(1)
-	s.Active.Add(1)
-	defer s.Active.Add(-1)
 	go ssh.DiscardRequests(reqs)
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":
-			if s.opts.RejectSessions {
-				_ = nc.Reject(ssh.Prohibited, "sessions disabled")
-				continue
-			}
 			ch, creqs, err := nc.Accept()
 			if err != nil {
 				continue
@@ -204,210 +187,85 @@ func (s *Server) forward(nc ssh.NewChannel) {
 
 func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
-	pty := false
 	for req := range reqs {
-		switch req.Type {
-		case "pty-req":
-			pty = true
-			_ = req.Reply(true, nil)
-		case "shell":
-			_ = req.Reply(true, nil)
-			s.shell(ch, pty)
-			return
-		case "exec":
-			var p struct{ Command string }
-			_ = ssh.Unmarshal(req.Payload, &p)
-			_ = req.Reply(true, nil)
-			code := s.exec(ch, p.Command)
-			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(code)}))
-			return
-		default:
-			_ = req.Reply(req.Type == "env", nil)
+		if req.Type != "exec" || s.opts.RejectExec {
+			_ = req.Reply(false, nil)
+			continue
 		}
+		var p struct{ Command string }
+		_ = ssh.Unmarshal(req.Payload, &p)
+		_ = req.Reply(true, nil)
+		s.mu.Lock()
+		s.commands = append(s.commands, p.Command)
+		s.mu.Unlock()
+		code := s.run(ch, reqs, p.Command)
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(code)}))
+		return
 	}
 }
 
-func (s *Server) exec(ch ssh.Channel, cmd string) int {
-	s.record(cmd)
-	fields := strings.Fields(cmd)
-	if len(fields) == 0 {
-		return 0
+// run executes command with /bin/sh. The process group is killed when the
+// client signals, closes the channel, or disconnects.
+func (s *Server) run(ch ssh.Channel, reqs <-chan *ssh.Request, command string) int {
+	n := s.running.Add(1)
+	defer s.running.Add(-1)
+	for p := s.peak.Load(); n > p && !s.peak.CompareAndSwap(p, n); p = s.peak.Load() {
 	}
-	arg := strings.TrimSpace(strings.TrimPrefix(cmd, fields[0]))
-	switch fields[0] {
-	case "hostname":
-		fmt.Fprintf(ch, "%s\n", s.opts.Hostname)
-	case "echo":
-		fmt.Fprintf(ch, "%s\n", arg)
-	case "uname":
-		fmt.Fprint(ch, "Linux test 6.1.0 #1 SMP x86_64 GNU/Linux\n")
-	case "df":
-		fmt.Fprint(ch, "Filesystem Size Used Avail Use% Mounted on\n/dev/sda1 50G 10G 40G 20% /\n")
-	case "uptime":
-		fmt.Fprint(ch, " 10:00:00 up 1 day,  1 user,  load average: 0.00, 0.01, 0.05\n")
-	case "exit":
-		n, _ := strconv.Atoi(arg)
-		return n
-	case "fail":
-		fmt.Fprint(ch.Stderr(), "boom: operation failed\n")
-		return 1
-	case "sleep":
-		d, _ := time.ParseDuration(arg)
-		time.Sleep(d)
-	case "flood":
-		n, _ := strconv.Atoi(arg)
-		line := strings.Repeat("x", 99) + "\n"
-		for i := 0; i < n; i++ {
-			if _, err := io.WriteString(ch, line); err != nil {
-				return 1
-			}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for range reqs { // any "signal" request or channel close kills the command
+			cancel()
 		}
-	default:
-		fmt.Fprintf(ch.Stderr(), "%s: command not found\n", fields[0])
+		cancel()
+	}()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	cmd.Dir = s.Dir
+	cmd.Env = []string{
+		"PATH=" + s.binDir + ":/usr/bin:/bin:/usr/sbin:/sbin",
+		"HOME=" + s.Dir,
+		"SUDO_TEST_PASSWORD=" + s.opts.SudoPassword,
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = ch, ch, ch.Stderr()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
+	err := cmd.Run()
+	if ee, ok := err.(*exec.ExitError); ok {
+		if code := ee.ExitCode(); code >= 0 {
+			return code
+		}
+		return 137
+	}
+	if err != nil {
 		return 127
 	}
 	return 0
 }
 
-// shell emulates a Cisco-IOS-like CLI.
-func (s *Server) shell(ch ssh.Channel, pty bool) {
-	r := bufio.NewReader(ch)
-	if s.opts.Banner != "" {
-		fmt.Fprintf(ch, "%s\r\n", strings.ReplaceAll(s.opts.Banner, "\n", "\r\n"))
-	}
-	mode := "" // "", "config", "config-if"
-	iface := ""
-	priv := s.opts.EnablePassword == ""
-	prompt := func() string {
-		suffix := ">"
-		if priv {
-			suffix = "#"
-		}
-		if mode != "" {
-			return fmt.Sprintf("%s(%s)#", s.opts.Hostname, mode)
-		}
-		return s.opts.Hostname + suffix
-	}
-	w := func(format string, a ...any) { fmt.Fprintf(ch, format, a...) }
-	invalid := func() { w("                ^\r\n%% Invalid input detected at '^' marker.\r\n\r\n") }
-	w("%s", prompt())
-	for {
-		line, err := readLine(r, ch, pty)
-		if err != nil {
-			return
-		}
-		cmd := strings.TrimSpace(line)
-		s.record(cmd)
-		switch {
-		case cmd == "":
-		case cmd == "enable":
-			w("Password: ")
-			pw, err := readLine(r, ch, false) // passwords are never echoed
-			if err != nil {
-				return
-			}
-			w("\r\n")
-			if strings.TrimSpace(pw) == s.opts.EnablePassword {
-				priv = true
-			} else {
-				w("%% Access denied\r\n")
-			}
-		case !priv:
-			invalid()
-		case cmd == "configure terminal" || cmd == "conf t":
-			w("Enter configuration commands, one per line.  End with CNTL/Z.\r\n")
-			mode = "config"
-		case strings.HasPrefix(cmd, "interface ") && mode != "":
-			iface = strings.TrimPrefix(cmd, "interface ")
-			mode = "config-if"
-		case strings.HasPrefix(cmd, "description ") && mode == "config-if":
-			d := strings.TrimPrefix(cmd, "description ")
-			if s.opts.FailDescription != "" && d == s.opts.FailDescription {
-				invalid()
-				break
-			}
-			s.mu.Lock()
-			s.descs[iface] = d
-			s.mu.Unlock()
-		case cmd == "exit" && mode == "config-if":
-			mode = "config"
-		case cmd == "exit" && mode == "config", cmd == "end":
-			mode = ""
-		case cmd == "exit" || cmd == "logout":
-			return
-		case cmd == "terminal length 0":
-		case cmd == "write memory" || cmd == "wr":
-			w("Building configuration...\r\n[OK]\r\n")
-		case cmd == "show version":
-			w("Cisco IOS Software, Emulator Software (TEST), Version 15.2\r\nuptime is 1 week\r\n")
-		case strings.HasPrefix(cmd, "show interface ") && strings.HasSuffix(cmd, " description"):
-			name := strings.TrimSuffix(strings.TrimPrefix(cmd, "show interface "), " description")
-			w("Interface                      Status         Protocol Description\r\n%-30s up             up       %s\r\n", name, s.Description(name))
-		case cmd == "show long":
-			for i := 1; i <= 100; i++ {
-				w("line %03d of long output\r\n", i)
-				if i%20 == 0 && i < 100 {
-					w(" --More-- ")
-					if _, err := r.ReadByte(); err != nil {
-						return
-					}
-					w("\b\b\b\b\b\b\b\b\b\b          \b\b\b\b\b\b\b\b\b\b")
-				}
-			}
-		case cmd == "show endless":
-			for {
-				w("more data\r\n --More-- ")
-				if _, err := r.ReadByte(); err != nil {
-					return
-				}
-			}
-		case cmd == "trickle": // steady output without a prompt, forever
-			for {
-				if _, err := io.WriteString(ch, "tick\r\n"); err != nil {
-					return
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-		case strings.HasPrefix(cmd, "sleep "):
-			d, _ := time.ParseDuration(strings.TrimPrefix(cmd, "sleep "))
-			time.Sleep(d)
-		case cmd == "hang":
-			w("working...\r\n")
-			_, _ = io.Copy(io.Discard, r) // never prints a prompt
-			return
-		case cmd == "drop":
-			return // closes the session abruptly
-		default:
-			invalid()
-		}
-		w("%s", prompt())
-	}
-}
-
-// readLine reads until CR or LF, echoing input when a PTY is allocated.
-func readLine(r *bufio.Reader, w io.Writer, echo bool) (string, error) {
-	var sb strings.Builder
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return "", err
-		}
-		if b == '\r' || b == '\n' {
-			if b == '\r' {
-				if r.Buffered() > 0 {
-					if nb, _ := r.Peek(1); nb[0] == '\n' {
-						_, _ = r.ReadByte()
-					}
-				}
-			}
-			if echo {
-				_, _ = io.WriteString(w, "\r\n")
-			}
-			return sb.String(), nil
-		}
-		sb.WriteByte(b)
-		if echo {
-			_, _ = w.Write([]byte{b})
-		}
-	}
-}
+// fakeSudo mimics the sudo flags the orchestrator uses: -S (password from the
+// first stdin line), -n (never prompt), -p, --. The rest of stdin is passed to
+// the command, exactly like real sudo.
+const fakeSudo = `#!/bin/sh
+mode=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -S) mode=S; shift ;;
+    -n) mode=n; shift ;;
+    -k) shift ;;
+    -p) shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+if [ -z "$SUDO_TEST_PASSWORD" ]; then
+  : # NOPASSWD: like real sudo, nothing is read from stdin
+elif [ "$mode" = S ]; then
+  IFS= read -r pw
+  if [ "$pw" != "$SUDO_TEST_PASSWORD" ]; then echo "sudo: incorrect password attempt" >&2; exit 1; fi
+else
+  echo "sudo: a password is required" >&2; exit 1
+fi
+export SUDO_USER=deploy
+exec "$@"
+`
