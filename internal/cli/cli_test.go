@@ -70,7 +70,7 @@ func TestInventoryWithUnknownFieldFails(t *testing.T) {
 func TestRunJSONAndReport(t *testing.T) {
 	f := setup(t)
 	report := filepath.Join(f.dir, "report.yaml")
-	code, stdout, stderr := main(t, "run", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known,
+	code, stdout, stderr := main(t, "run", "--execute", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known,
 		"--group", "web", "--output", "json", "--report", report)
 	if code != ExitHostsFailed {
 		t.Fatalf("web-02 fails, want exit 2, got %d: %s", code, stderr)
@@ -98,7 +98,7 @@ func TestRunJSONAndReport(t *testing.T) {
 
 func TestRunTableAndVars(t *testing.T) {
 	f := setup(t)
-	code, stdout, _ := main(t, "run", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known,
+	code, stdout, _ := main(t, "run", "--execute", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known,
 		"--host", "other", "--var", "color=green", "--verbose")
 	if code != ExitOK || !strings.Contains(stdout, "other") || !strings.Contains(stdout, "| color=green") ||
 		!strings.Contains(stdout, "1 hosts: 1 succeeded") {
@@ -106,12 +106,12 @@ func TestRunTableAndVars(t *testing.T) {
 	}
 }
 
-func TestDryRunAndValidateDoNotConnect(t *testing.T) {
+func TestRunPreviewsByDefaultAndValidateDoesNotConnect(t *testing.T) {
 	f := setup(t)
-	os.Unsetenv("RCO_TEST_PW") // dry-run must not need secrets
-	code, stdout, _ := main(t, "run", "--inventory", f.inv, "--job", f.job, "--dry-run", "--tag", "prod")
+	os.Unsetenv("RCO_TEST_PW") // a preview must not need secrets
+	code, stdout, _ := main(t, "run", "--inventory", f.inv, "--job", f.job, "--tag", "prod")
 	t.Setenv("RCO_TEST_PW", "cli-secret")
-	if code != ExitOK || !strings.Contains(stdout, "echo color=red") || !strings.Contains(stdout, "dry run: 2 hosts") {
+	if code != ExitOK || !strings.Contains(stdout, "echo color=red") || !strings.Contains(stdout, "preview: 2 hosts") {
 		t.Fatalf("%d\n%s", code, stdout)
 	}
 	code, stdout, _ = main(t, "validate", "--job", f.job)
@@ -122,8 +122,28 @@ func TestDryRunAndValidateDoNotConnect(t *testing.T) {
 	if code != ExitOK || !strings.Contains(stdout, "valid for 3 hosts") {
 		t.Fatalf("%d %s", code, stdout)
 	}
+	os.Unsetenv("RCO_TEST_PW")
+	if code, _, stderr := main(t, "validate", "--job", f.job, "--inventory", f.inv); code != ExitError || !strings.Contains(stderr, "RCO_TEST_PW") {
+		t.Fatalf("validate must check credentials: %d %s", code, stderr)
+	}
 	if f.srv.Conns.Load() != 0 {
-		t.Fatal("dry-run and validate must not connect")
+		t.Fatal("run without --execute and validate must not connect")
+	}
+}
+
+func TestShortAliases(t *testing.T) {
+	f := setup(t)
+	code, stdout, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known,
+		"-g", "web", "-t", "prod", "-H", "web-01", "-o", "json", "-q", "-c", "1")
+	if code != ExitOK || strings.Contains(stderr, "level=INFO") {
+		t.Fatalf("%d %s", code, stderr)
+	}
+	var rep runner.Report
+	if err := json.Unmarshal([]byte(stdout), &rep); err != nil || rep.Summary.Total != 1 || rep.Hosts[0].Host != "web-01" {
+		t.Fatalf("%v %+v", err, rep.Summary)
+	}
+	if code, out, _ := main(t, "run", "-i", f.inv, "-j", f.job, "-H", "other", "-v"); code != ExitOK || !strings.Contains(out, "preview: 1 hosts") {
+		t.Fatalf("bool alias -v: %d %s", code, out)
 	}
 }
 

@@ -1,0 +1,64 @@
+# Production. Running a job here always means typing this path on purpose.
+credentials:
+  deploy-key:
+    type: private_key
+    username: deploy
+    key_file: ~/.ssh/deploy_ed25519
+    sudo_password_env: DEPLOY_SUDO_PASSWORD     # omit for NOPASSWD sudo
+  deploy-key-encrypted:
+    type: private_key
+    username: deploy
+    key_file: ~/.ssh/deploy_rsa
+    passphrase_env: DEPLOY_KEY_PASSPHRASE
+  legacy-password:
+    type: password
+    username: admin
+    password_env: LEGACY_PASSWORD              # also used for sudo
+  bastion-key:
+    type: private_key
+    username: jump
+    key_file: ~/.ssh/bastion_ed25519
+
+# Hosts reachable only through a jump host. Tunnelling is native Go
+# (x/crypto/ssh direct-tcpip); no ssh binary is executed.
+bastions:
+  corp-bastion:
+    address: bastion.example.com
+    credential: bastion-key
+
+defaults:
+  credential: deploy-key
+  variables:
+    ntp_server: ntp1.example.com
+    db_user: app
+
+groups:
+  web:
+    defaults:
+      tags: [web]
+    hosts:
+      - name: web-01
+        address: 10.20.1.10
+      - name: web-02
+        address: 10.20.1.11
+        tags: [canary]                         # --tag canary: roll out here first
+
+  db:
+    defaults:
+      bastion: corp-bastion
+      credential: deploy-key-encrypted
+    hosts:
+      - name: db-01
+        address: 10.50.2.10
+      - name: db-02
+        address: 10.50.2.11
+        port: 2222
+        variables:
+          ntp_server: ntp2.example.com         # host value wins over defaults
+
+  legacy:
+    defaults:
+      credential: legacy-password
+    hosts:
+      - name: old-app-01
+        address: 10.20.9.5

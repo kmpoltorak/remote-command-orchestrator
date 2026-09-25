@@ -120,8 +120,16 @@ type ValidationError struct {
 
 func (e *ValidationError) Error() string { return "job invalid: " + strings.Join(e.Issues, "; ") }
 
+// DefaultFile is the job file name inside a job directory.
+const DefaultFile = "job.yaml"
+
 // Load reads a job file and every file it references, then validates it.
+// path may be a job directory, meaning <dir>/job.yaml; keeping each job in its
+// own directory keeps its scripts and files next to it.
 func Load(path string) (*Job, error) {
+	if st, err := os.Stat(path); err == nil && st.IsDir() {
+		path = filepath.Join(path, DefaultFile)
+	}
 	data, err := ReadFile(path, MaxFileSize)
 	if err != nil {
 		return nil, err

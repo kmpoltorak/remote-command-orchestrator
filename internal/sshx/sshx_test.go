@@ -91,6 +91,63 @@ func TestHostKeyVerification(t *testing.T) {
 	c.Close()
 }
 
+// Real servers offer several host key types while known_hosts often holds
+// just one. The client must negotiate the type it knows, like OpenSSH does,
+// instead of reporting a false HOST_KEY_MISMATCH.
+func TestHostKeyAlgorithmFromKnownHosts(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
+	for name, key := range map[string]ssh.PublicKey{"ed25519": srv.HostKey.PublicKey(), "ecdsa": srv.ECDSAKey.PublicKey()} {
+		kh := filepath.Join(t.TempDir(), "kh")
+		os.WriteFile(kh, []byte(srv.KnownHostsLineFor(key)), 0o600)
+		c, err := dialer(kh).Dial(context.Background(), hop(srv, "pw"), nil, nil)
+		if err != nil {
+			t.Errorf("known_hosts with only %s key: %v", name, err)
+			continue
+		}
+		c.Close()
+	}
+}
+
+func TestAcceptNewHostKeys(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
+	kh := filepath.Join(t.TempDir(), "sub", "known_hosts") // missing dir and file are created
+	d := dialer(kh)
+	d.HostKeys.AcceptNew = true
+	// Many parallel first contacts must add the host exactly once.
+	errs := make(chan error, 10)
+	for range 10 {
+		go func() {
+			c, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil)
+			if err == nil {
+				c.Close()
+			}
+			errs <- err
+		}()
+	}
+	for range 10 {
+		if err := <-errs; err != nil {
+			t.Fatalf("first contact: %v", err)
+		}
+	}
+	data, _ := os.ReadFile(kh)
+	if n := strings.Count(string(data), "\n"); n != 1 {
+		t.Fatalf("want exactly one known_hosts line, got %d:\n%s", n, data)
+	}
+	// The recorded key is trusted by a strict client afterwards.
+	c, err := dialer(kh).Dial(context.Background(), hop(srv, "pw"), nil, nil)
+	if err != nil {
+		t.Fatalf("strict dial after accept-new: %v", err)
+	}
+	c.Close()
+	// A changed key is still rejected, even with AcceptNew.
+	other := sshtest.Start(t, sshtest.Options{Password: "pw"})
+	_, port, _ := net.SplitHostPort(srv.Addr)
+	os.WriteFile(kh, []byte("[127.0.0.1]:"+port+" "+string(ssh.MarshalAuthorizedKey(other.HostKey.PublicKey()))), 0o600)
+	if _, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil); category(err) != domain.CatHostKeyMismatch {
+		t.Fatalf("changed key must fail with accept-new: %v", err)
+	}
+}
+
 func TestConnectionFailures(t *testing.T) {
 	d := dialer("/dev/null")
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")

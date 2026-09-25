@@ -11,6 +11,7 @@ id_*
 .idea/
 .vscode/
 
-# Local-only planning files
+# Local-only planning and production files
 /prompt.md
 /IMPLEMENTATION_PLAN.md
+/local/

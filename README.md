@@ -11,11 +11,12 @@ exactly what happened where.
 - Upload files, optionally rendered from a template per host, and replace them atomically.
 - Host keys are verified against `known_hosts` by default.
 - Every host is validated before any host is contacted, so a typo never leaves you with a half-applied change.
+- Safe by default: `rco run` only previews what it would do. Nothing touches a host without `--execute`.
 - Parallel with a hard limit (`--concurrency`). Ctrl+C cancels cleanly.
 - Output as a table, JSON or YAML, plus an optional report file. Secrets are masked everywhere.
 
 ```text
-$ rco run --inventory hosts.yaml --job configure-ntp.yaml --group web --var ntp_server=ntp1.example.com
+$ rco run --inventory hosts.yaml --job jobs/configure-ntp --group web --var ntp_server=ntp1.example.com --execute
 HOST     STATUS   FAILED STEP  REASON                                   DURATION
 web-01   SUCCESS  -            -                                        2.41s
 web-02   SUCCESS  -            -                                        2.37s
@@ -27,7 +28,8 @@ web-03   FAILED   verify       output does not contain "ntp1.example"   2.52s
 ## Install
 
 ```bash
-go install github.com/kmpoltorak/remote-command-orchestrator/cmd/rco@latest
+# the repository is private: let Go fetch it with your git credentials
+GOPRIVATE=github.com/kmpoltorak/* go install github.com/kmpoltorak/remote-command-orchestrator/cmd/rco@latest
 # or from a checkout:
 make build        # -> bin/rco
 ```
@@ -59,7 +61,7 @@ groups:
         address: 10.20.1.11
 ```
 
-2. Describe the change (`uptime.yaml`):
+2. Describe the change in its own folder (`jobs/uptime/job.yaml`):
 
 ```yaml
 name: uptime
@@ -71,14 +73,43 @@ steps:
 3. Check it, preview it, run it:
 
 ```bash
-rco validate --job uptime.yaml --inventory hosts.yaml
-rco run --inventory hosts.yaml --job uptime.yaml --dry-run
-rco run --inventory hosts.yaml --job uptime.yaml --verbose
+rco validate --job jobs/uptime --inventory hosts.yaml
+rco run --inventory hosts.yaml --job jobs/uptime                       # preview only
+rco run --inventory hosts.yaml --job jobs/uptime --execute --verbose   # apply
 ```
 
 The hosts must be in `~/.ssh/known_hosts` (see [Host keys](#host-keys)).
 
 ## Job files
+
+### Organizing jobs
+
+`rco` imposes no layout. `--job` accepts a directory (it loads `job.yaml` from
+it) or a path to any YAML file. Paths in `script:` and `copy.src` are relative
+to the job file, so it works wherever the job lives.
+
+We recommend one folder per job: `job.yaml` plus the scripts and files it uses.
+Nothing gets mixed up between jobs, and a job folder can be moved or copied as a
+unit:
+
+```text
+jobs/
+├── configure-ntp/
+│   ├── job.yaml
+│   ├── files/chrony.conf.tmpl
+│   └── scripts/restart-chrony.sh
+├── create-db-user/
+│   └── job.yaml
+└── system-info/
+    └── job.yaml
+```
+
+`examples/jobs/` uses this layout. For real use, keep your jobs and inventories
+in a separate repository of their own, so every change to your fleet's
+configuration is versioned and reviewable. It contains no secrets, only
+references to them (see [Secrets](#secrets)).
+
+### Steps
 
 A job is an ordered list of steps. On each host, all steps run over **one SSH
 connection**, in order. A failing step stops that host unless the step sets
@@ -109,7 +140,7 @@ steps:
 
   - name: upload-config
     copy:
-      src: files/chrony.conf.tmpl        # relative to the job file
+      src: files/chrony.conf.tmpl        # relative to job.yaml
       dest: /etc/chrony/chrony.conf
       mode: "0644"                       # default 0644
       template: true                     # render {{ .var }} inside the file
@@ -194,7 +225,7 @@ steps:
 ```
 
 ```bash
-DB_PASSWORD=... rco run ... --var-env db_password=DB_PASSWORD
+DB_PASSWORD=... rco run ... --var-env db_password=DB_PASSWORD --execute
 ```
 
 `rco` refuses sensitive values given with `--var` or in the inventory, and refuses
@@ -265,9 +296,41 @@ are errors, so typos are caught.
 --tag canary                # hosts tagged canary
 --host web-01 --host db-01  # explicit hosts
 --group web --tag canary    # AND across kinds: canary hosts in web
+-g web -t canary            # same, with short flags
 ```
 
 With no selectors, every host is selected. Unknown groups or hosts are errors.
+
+### Environments
+
+Recommended: split **inventories** by environment and keep **jobs** shared.
+
+```text
+inventories/
+├── test/hosts.yaml
+├── dev/hosts.yaml
+└── prod/hosts.yaml
+jobs/
+└── configure-ntp/job.yaml      # one job for every environment
+```
+
+```bash
+rco run --inventory inventories/test/hosts.yaml --job jobs/configure-ntp --execute
+rco run --inventory inventories/prod/hosts.yaml --job jobs/configure-ntp --execute
+```
+
+- **Inventories per environment.** Environments are different hosts with
+  different credentials and values. Touching prod always means typing a `prod/`
+  path on purpose. `examples/inventories/` uses this layout.
+- **Jobs are not split.** A job says *what* to do, and the inventory says *where*
+  and *with which values*. Differences between environments (another NTP server,
+  another database user) belong in the inventory's `variables`. Copies of a job
+  in `jobs/test/` and `jobs/prod/` would drift apart, and prod would run
+  something other than what was tested. The `hash` in the report shows that test
+  and prod ran exactly the same job.
+- Use tags **within** an environment to pick a subset, such as `--tag canary`.
+  Keeping environments as groups or tags in one file also works, but a forgotten
+  selector then selects every host, prod included.
 
 ## Authentication and sudo
 
@@ -291,11 +354,24 @@ It is uploaded to a temp file first.
 
 Host keys are checked against `~/.ssh/known_hosts` (`--known-hosts FILE`). An
 unknown host fails with `HOST_KEY_UNKNOWN`, and a changed key fails with
-`HOST_KEY_MISMATCH`. Neither is ever retried. To trust a new host, verify its
-fingerprint out of band, then:
+`HOST_KEY_MISMATCH`. Neither is ever retried. Servers usually have several key
+types (ed25519, ecdsa, rsa). Like OpenSSH, `rco` negotiates a type that
+`known_hosts` already holds for the host, so one entry per host is enough.
+
+To trust a new host, either verify its fingerprint out of band and add it:
 
 ```bash
 ssh-keyscan -p 22 10.20.1.10 >> ~/.ssh/known_hosts
+```
+
+or let `rco` add it on first contact with `--accept-new-host-keys`. This works
+like OpenSSH's `StrictHostKeyChecking=accept-new`: a host that has no entry yet
+is added (the fingerprint is logged), while a host whose key **changed** is
+still rejected with `HOST_KEY_MISMATCH`. The known_hosts file and its directory
+are created if missing, so a dedicated file works out of the box:
+
+```bash
+rco run ... --known-hosts ~/rco/known_hosts --accept-new-host-keys --execute
 ```
 
 `--insecure-skip-host-key-check` disables verification for lab use and logs a
@@ -304,28 +380,44 @@ warning. Never use it on networks you don't control.
 ## Running
 
 ```text
-rco run --inventory FILE --job FILE [selectors] [options]
+rco run --inventory FILE --job JOB [selectors] [options]
 
-  --var NAME=VALUE           job variable (repeatable)
-  --var-env NAME=ENV_VAR     job variable read from the environment (repeatable)
-  --concurrency N            hosts processed at the same time (default 100)
-  --timeout D                default step timeout (default 5m)
-  --connect-timeout D        TCP connect timeout (default 10s)
-  --handshake-timeout D      SSH handshake + auth timeout (default 15s)
-  --connect-retries N        extra attempts for transient connection errors (default 2)
-  --retry-delay D            base retry delay, exponential with jitter (default 2s)
-  --max-retry-delay D        cap for connection retry delay (default 30s)
-  --max-output BYTES         stdout/stderr kept per step (default 1 MiB)
-  --known-hosts FILE         known_hosts file (default ~/.ssh/known_hosts)
-  --insecure-skip-host-key-check
-  --output table|json|yaml   stdout format (default table)
-  --report FILE              also write the full report (.json/.yaml)
-  --dry-run                  show what would run per host; no connections
-  --verbose                  table: show every step with its output
-  --quiet                    log warnings and errors only
+  JOB is a job directory (containing job.yaml) or a job YAML file.
+
+  -i, --inventory FILE       inventory file
+  -j, --job JOB              job directory or file
+  -g, --group NAME           select hosts in group (repeatable)
+  -t, --tag NAME             select hosts with tag (repeatable)
+  -H, --host NAME            select host by name (repeatable)
+
+      --execute              actually run the job; without it rco only prints a
+                             preview per host and connects to nothing
+
+      --var NAME=VALUE       job variable (repeatable)
+      --var-env NAME=ENV_VAR job variable read from the environment (repeatable)
+  -c, --concurrency N        hosts processed at the same time (default 100)
+      --timeout D            default step timeout (default 5m)
+      --connect-timeout D    TCP connect timeout (default 10s)
+      --handshake-timeout D  SSH handshake + auth timeout (default 15s)
+      --connect-retries N    extra attempts for transient connection errors (default 2)
+      --retry-delay D        base retry delay, exponential with jitter (default 2s)
+      --max-retry-delay D    cap for connection retry delay (default 30s)
+      --max-output BYTES     stdout/stderr kept per step (default 1 MiB)
+      --known-hosts FILE     known_hosts file (default ~/.ssh/known_hosts)
+      --accept-new-host-keys add keys of unknown hosts to known_hosts; changed keys still fail
+      --insecure-skip-host-key-check
+  -o, --output FORMAT        stdout format: table, json or yaml (default table)
+      --report FILE          also write the full report (.json/.yaml)
+  -v, --verbose              table: show every step with its output
+  -q, --quiet                log warnings and errors only
 ```
 
-- **stdout** carries results only and **stderr** carries logs, so `rco run ... --output json | jq` works.
+- Every flag also works with a single dash (`-execute`). `--execute` has no
+  short form on purpose: applying changes is always typed out in full.
+- **Preview is the default.** Without `--execute`, `rco run` validates everything
+  and prints the steps per host (or JSON/YAML with `--output`) without connecting
+  or reading any key or password.
+- **stdout** carries results only and **stderr** carries logs, so `rco run ... --execute --output json | jq` works.
 - **Exit codes**: `0` means every host succeeded, `2` means the run finished but some host
   failed or was cancelled, and `1` means a usage, validation or file error, in which case no host was contacted.
 - **Connection retries** apply only to transient errors: timeouts, refused
@@ -336,7 +428,7 @@ rco run --inventory FILE --job FILE [selectors] [options]
 - **Ctrl+C** stops starting new hosts, kills running commands, and still
   prints and writes the report. Unfinished hosts are `CANCELLED`.
 
-`rco validate --job FILE [--inventory FILE ...]` checks the job file and, when
+`rco validate --job JOB [--inventory FILE ...]` checks the job and, when
 an inventory is given, variables and credentials for every selected host,
 without connecting.
 
@@ -375,7 +467,8 @@ Failure categories: `CONNECTION_TIMEOUT`, `CONNECTION_REFUSED`, `DNS_FAILURE`,
 flowchart LR
     A[job + inventory] --> B[validate every host:<br/>variables, templates, secrets]
     B -->|any error| X[exit 1, nothing contacted]
-    B --> C[up to --concurrency hosts in parallel]
+    B -->|no --execute| P[print preview, exit 0]
+    B -->|--execute| C[up to --concurrency hosts in parallel]
     C --> D[SSH connect<br/>direct or via bastion,<br/>known_hosts check]
     D --> E[steps in order,<br/>one channel each]
     E --> F[report: stdout / file]
@@ -385,7 +478,7 @@ flowchart LR
 
 - Linux-like hosts only (POSIX `sh` plus `bash` for scripts). No Windows, no network-device CLIs.
 - No history database. Keep the `--report` files if you need an audit trail.
-- No ssh-agent support and no automatic `known_hosts` updates, both by design.
+- No ssh-agent support, by design.
 - Steps are not rolled back automatically. Write jobs so they can safely be run again.
 
 ## Development
@@ -393,7 +486,13 @@ flowchart LR
 ```bash
 make check    # gofmt, go vet, go test -race, go build (same as CI)
 make lint     # golangci-lint
+make build    # bin/rco
 ```
+
+Keep personal test inventories and jobs in `local/` at the repository root.
+It is git-ignored, so hosts and key paths never end up in a commit.
+
+### Code layout
 
 The tests start real SSH servers in-process (`internal/sshtest`). They run
 genuine shell commands in temp directories with a fake `sudo`, so the whole
@@ -402,13 +501,28 @@ suite runs offline in a few seconds.
 | Package | Purpose |
 |---|---|
 | `cmd/rco` | entry point |
-| `internal/cli` | flags, output formats, dry-run |
+| `internal/cli` | flags, output formats, preview |
 | `internal/job` | job file parsing, validation, variables, remote command building |
 | `internal/inventory` | inventory parsing, inheritance, host selection |
 | `internal/credentials` | keys, passwords, sudo passwords, redaction |
 | `internal/runner` | parallel execution, retries, expectations, report |
 | `internal/sshx` | SSH dial (with bastion), host keys, exec with bounded output |
 | `internal/sshtest` | in-process SSH server for tests |
+
+### Versions and releases
+
+`make build` stamps the version from `git describe --tags --always --dirty`,
+and `rco version` prints it:
+
+| `rco version` | Meaning |
+|---|---|
+| `rco v0.1.0` | built exactly from tag `v0.1.0` |
+| `rco v0.1.0-3-g9c1d2e3` | 3 commits after `v0.1.0`, at commit `9c1d2e3` |
+| `rco 9c1d2e3` | no tags yet, commit `9c1d2e3` |
+| `…-dirty` | built with uncommitted changes, so it matches no commit exactly |
+
+To release, tag `main` (`git tag v0.1.0 && git push origin v0.1.0`) and build
+from the tag.
 
 ## License
 

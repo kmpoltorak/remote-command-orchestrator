@@ -7,7 +7,7 @@ import (
 )
 
 func TestExamplesLoad(t *testing.T) {
-	files, _ := filepath.Glob("../../examples/inventories/*.yaml")
+	files, _ := filepath.Glob("../../examples/inventories/*/hosts.yaml")
 	if len(files) < 2 {
 		t.Fatalf("expected examples, got %d", len(files))
 	}
