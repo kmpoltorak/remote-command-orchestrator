@@ -1,6 +1,7 @@
 name: create-db-user
 description: Sensitive variables (pass with --var-env, never on the command line)
 version: "1.0"
+max_failures: 1   # touches databases: stop at the first failure
 
 variables:
   db_user:

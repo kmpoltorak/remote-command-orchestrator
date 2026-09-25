@@ -65,6 +65,7 @@ groups:
 
 ```yaml
 name: uptime
+max_failures: "100%"   # read-only, never stop (required field, see below)
 steps:
   - name: uptime
     command: uptime
@@ -119,6 +120,7 @@ connection**, in order. A failing step stops that host unless the step sets
 name: configure-ntp            # required
 description: Install chrony and push its config
 version: "1.2"                 # free text, shown in reports
+max_failures: "5%"             # required: stop starting hosts after 5% failed
 
 variables:
   ntp_server:
@@ -155,6 +157,13 @@ steps:
       contains: "{{ .ntp_server }}"
       not_contains: "503 No such source"
 ```
+
+`max_failures` is required in every job. Once this many hosts have failed
+(`"5"`) or this share of the selected hosts (`"5%"`), no new host is started.
+Hosts already running finish, and the rest are reported as `SKIPPED`. Whoever
+writes the job decides how much breakage is acceptable: `1` for a risky
+database change, `"100%"` (never stop) for read-only fact gathering.
+`--max-failures` on the command line overrides it for one run.
 
 ### Step types
 
@@ -442,7 +451,7 @@ rco validate -j JOB [-i INVENTORY [selectors]]                      check withou
       --var NAME=VALUE                job variable NAME=VALUE (repeatable)
       --var-env NAME=ENV_VAR          job variable NAME=ENV_VAR read from the environment; required for sensitive variables (repeatable)
   -c, --concurrency N                 maximum hosts processed at the same time (default 100)
-      --max-failures N                stop starting new hosts after N failed hosts, or N% of all hosts; the rest are SKIPPED
+      --max-failures N                override the job's max_failures: stop starting new hosts after N failed hosts, or N% of all hosts; the rest are SKIPPED
       --only-failed REPORT            run only on hosts that did not succeed in a previous REPORT (.json, .yaml or .jsonl)
       --timeout DURATION              default per-step timeout (job file values win) (default 5m0s)
       --connect-timeout DURATION      TCP connect timeout (default 10s)
@@ -467,7 +476,7 @@ rco validate -j JOB [-i INVENTORY [selectors]]                      check withou
   or reading any key or password.
 - **stdout** carries results only and **stderr** carries logs, so `rco run ... --execute --output json | jq` works.
 - **Exit codes**: `0` means every host succeeded, `2` means the run finished but some host
-  failed, was skipped (`--max-failures`) or cancelled, and `1` means a usage, validation or file error, in which case no host was contacted.
+  failed, was skipped (`max_failures`) or cancelled, and `1` means a usage, validation or file error, in which case no host was contacted.
 - **Connection retries** apply only to transient errors: timeouts, refused
   connections, broken handshakes. Authentication, host key and DNS errors fail
   immediately.
@@ -523,15 +532,15 @@ dropped. Only hosts that currently hold a slot have an open connection.
 ```bash
 # 1. canaries first
 rco run -i prod/hosts.yaml -j jobs/x -t canary --execute
-# 2. everything, stop if 1% of hosts fail, stream the report
-rco run -i prod/hosts.yaml -j jobs/x --execute -c 300 --max-failures 1% --report run.jsonl
+# 2. everything (the job's max_failures applies), stream the report
+rco run -i prod/hosts.yaml -j jobs/x --execute -c 300 --report run.jsonl
 # 3. after fixing the cause: only the hosts that did not succeed
 rco run -i prod/hosts.yaml -j jobs/x --execute --only-failed run.jsonl --report run2.jsonl
 ```
 
-- **`--max-failures N` or `N%`**: once that many hosts have failed, no new hosts
-  are started. Hosts already running finish, and the rest are reported as `SKIPPED`.
-  A broken job then stops after a handful of hosts instead of hitting all 30 000.
+- **`max_failures`** (required in every job, `--max-failures` overrides it):
+  once that many hosts have failed, no new hosts are started. A broken job then
+  stops after a handful of hosts instead of hitting all 30 000.
 - **`--only-failed REPORT`** reruns only the hosts that were not `SUCCESS` in a
   previous `.json`, `.yaml` or `.jsonl` report. Selectors still apply.
 - **Progress**: every 10 seconds `rco` logs `done`, `total`, `running`, `failed`

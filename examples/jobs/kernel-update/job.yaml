@@ -1,6 +1,7 @@
 name: kernel-update
 description: Upgrade packages, reboot, and verify the host came back healthy
 version: "1.0"
+max_failures: 2   # reboots hosts: stop after 2 failures
 
 defaults:
   sudo: true

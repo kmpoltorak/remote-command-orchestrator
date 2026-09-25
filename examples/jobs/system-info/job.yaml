@@ -1,6 +1,7 @@
 name: system-info
 description: Read-only facts from Linux hosts
 version: "1.0"
+max_failures: "100%"   # read-only: never stop, collect everything
 
 defaults:
   timeout: 15s

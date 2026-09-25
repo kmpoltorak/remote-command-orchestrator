@@ -49,6 +49,9 @@ func loadJob(t *testing.T, yaml string, files map[string]string) *job.Job {
 	for name, body := range files {
 		os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600)
 	}
+	if !strings.Contains(yaml, "max_failures") {
+		yaml = "max_failures: \"100%\"\n" + strings.TrimLeft(yaml, "\n") // these tests are not about it
+	}
 	p := filepath.Join(dir, "job.yaml")
 	os.WriteFile(p, []byte(yaml), 0o600)
 	j, err := job.Load(p)

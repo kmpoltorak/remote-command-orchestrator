@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -112,7 +110,7 @@ func newFlags(name string) *flags {
 	fs.Var(&f.vars, "var", "job variable `NAME=VALUE` (repeatable)")
 	fs.Var(&f.varEnvs, "var-env", "job variable `NAME=ENV_VAR` read from the environment; required for sensitive variables (repeatable)")
 	fs.IntVar(&o.Concurrency, "concurrency", 100, "maximum hosts processed at the same time")
-	fs.StringVar(&f.maxFailures, "max-failures", "", "stop starting new hosts after `N` failed hosts, or N% of all hosts; the rest are SKIPPED")
+	fs.StringVar(&f.maxFailures, "max-failures", "", "override the job's max_failures: stop starting new hosts after `N` failed hosts, or N% of all hosts; the rest are SKIPPED")
 	fs.StringVar(&f.onlyFailed, "only-failed", "", "run only on hosts that did not succeed in a previous `REPORT` (.json, .yaml or .jsonl)")
 	fs.DurationVar(&o.StepTimeout, "timeout", 5*time.Minute, "default per-step timeout (job file values win)")
 	fs.DurationVar(&o.ConnectTimeout, "connect-timeout", 10*time.Second, "TCP connect timeout")
@@ -235,8 +233,13 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	if len(targets) == 0 {
 		return fail("no hosts match the selectors")
 	}
-	if o.MaxFailures, err = parseMaxFailures(f.maxFailures, len(targets)); err != nil {
-		return fail("%v", err)
+	// The job's max_failures applies unless --max-failures overrides it.
+	limit := j.MaxFailures
+	if f.maxFailures != "" {
+		limit = f.maxFailures
+	}
+	if o.MaxFailures, err = job.ParseMaxFailures(limit, len(targets)); err != nil {
+		return fail("max failures %v", err)
 	}
 	in := runner.Input{Job: j, Targets: targets}
 	if in.Vars, err = pairs(f.vars, "--var"); err != nil {
@@ -263,7 +266,7 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	}
 	if !f.execute {
 		stream.discard()
-		return printPreview(stdout, f.output, r)
+		return printPreview(stdout, f.output, r, o.MaxFailures)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -286,25 +289,6 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 		return ExitHostsFailed
 	}
 	return ExitOK
-}
-
-// parseMaxFailures accepts "", "N" or "N%" (of the selected hosts, at least 1).
-func parseMaxFailures(v string, total int) (int, error) {
-	if v == "" {
-		return 0, nil
-	}
-	pct := strings.HasSuffix(v, "%")
-	n, err := strconv.ParseFloat(strings.TrimSuffix(v, "%"), 64)
-	if err != nil || n <= 0 || (pct && n > 100) {
-		return 0, fmt.Errorf("--max-failures %q: want a positive number or a percentage like 5%%", v)
-	}
-	if pct {
-		return max(1, int(math.Ceil(n*float64(total)/100))), nil
-	}
-	if n != math.Trunc(n) {
-		return 0, fmt.Errorf("--max-failures %q: want a whole number of hosts", v)
-	}
-	return int(n), nil
 }
 
 func pairs(in []string, flagName string) (map[string]string, error) {
@@ -411,7 +395,7 @@ type dryStep struct {
 	Timeout string `json:"timeout" yaml:"timeout"`
 }
 
-func printPreview(w io.Writer, format string, r *runner.Runner) int {
+func printPreview(w io.Writer, format string, r *runner.Runner, maxFailures int) int {
 	var out []dryHost
 	for _, p := range r.Plans {
 		d := dryHost{Host: p.Target.Name, Address: p.Target.Addr(), User: p.Target.Username}
@@ -443,6 +427,6 @@ func printPreview(w io.Writer, format string, r *runner.Runner) int {
 			fmt.Fprintf(w, "  %d. %-20s %s%s\n", i+1, s.Name, sudo, s.Command)
 		}
 	}
-	fmt.Fprintf(w, "\npreview: %d hosts, nothing was executed. Add --execute to apply.\n", len(out))
+	fmt.Fprintf(w, "\npreview: %d hosts, stop after %d failed hosts; nothing was executed. Add --execute to apply.\n", len(out), maxFailures)
 	return ExitOK
 }

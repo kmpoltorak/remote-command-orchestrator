@@ -45,6 +45,7 @@ hosts:
 	os.WriteFile(f.job, []byte(`
 name: cli-test
 version: "1.0"
+max_failures: "100%"
 variables: {color: {default: none}}
 steps:
   - {name: greet, command: "echo color={{ .color }}"}
@@ -169,19 +170,26 @@ func TestHelpListsEveryFlag(t *testing.T) {
 	}
 }
 
-func TestParseMaxFailures(t *testing.T) {
-	cases := map[string]int{"": 0, "3": 3, "10%": 100, "0.1%": 1, "100%": 1000}
-	for in, want := range cases {
-		if got, err := parseMaxFailures(in, 1000); err != nil || got != want {
-			t.Errorf("%q: got %d %v, want %d", in, got, err, want)
-		}
+func TestMaxFailuresFromJobAndOverride(t *testing.T) {
+	f := setup(t)
+	os.WriteFile(f.job, bytes.Replace(mustRead(f.job), []byte(`max_failures: "100%"`), []byte(`max_failures: 1`), 1), 0o600)
+	// The job's max_failures is applied (skipping itself is covered in the runner tests).
+	code, stdout, _ := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known, "-c", "1", "-o", "json", "-q")
+	var r runner.Report
+	if code != ExitHostsFailed || json.Unmarshal([]byte(stdout), &r) != nil || r.Summary.Failed != 1 {
+		t.Fatalf("%d %+v", code, r.Summary)
 	}
-	for _, bad := range []string{"0", "-1", "abc", "101%", "2.5"} {
-		if _, err := parseMaxFailures(bad, 1000); err == nil {
-			t.Errorf("%q must be rejected", bad)
-		}
+	// Preview shows the effective limit; the flag overrides the job.
+	_, out, _ := main(t, "run", "-i", f.inv, "-j", f.job, "--max-failures", "50%")
+	if !strings.Contains(out, "stop after 2 failed hosts") {
+		t.Fatalf("override: %s", out)
+	}
+	if code, _, stderr := main(t, "run", "-i", f.inv, "-j", f.job, "--max-failures", "0"); code != ExitError || !strings.Contains(stderr, "max failures") {
+		t.Fatalf("invalid override must fail: %d %s", code, stderr)
 	}
 }
+
+func mustRead(p string) []byte { b, _ := os.ReadFile(p); return b }
 
 func TestJSONLReportAndOnlyFailed(t *testing.T) {
 	f := setup(t)
