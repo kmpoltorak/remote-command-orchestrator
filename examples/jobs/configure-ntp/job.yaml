@@ -1,6 +1,7 @@
 name: configure-ntp
 description: Install chrony, push its config from a template and restart it
 version: "1.2"
+max_failures: "5%"   # stop the rollout once 5% of hosts failed
 
 variables:
   ntp_server:

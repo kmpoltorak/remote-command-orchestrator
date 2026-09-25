@@ -1,0 +1,21 @@
+name: openwrt-sim-switch
+description: >
+  Switch the active SIM card on OpenWrt-based routers (Teltonika RutOS,
+  gsmctl -Y). Fire and forget: the switch drops the mobile uplink and with it
+  the SSH connection, so rco only starts the command and checks nothing.
+version: "1.0"
+max_failures: 1              # a router that fails to start the switch needs a human
+
+# OpenWrt: log in as root (no sudo) and use plain `command:` steps.
+# `script:` steps need bash, which OpenWrt does not ship by default.
+
+defaults:
+  timeout: 30s
+
+steps:
+  - name: uplink-before
+    command: ip -4 route show default
+
+  - name: switch-sim
+    command: gsmctl -Y
+    fire_and_forget: true    # start it and stop; the connection may drop

@@ -28,6 +28,7 @@ type Summary struct {
 	Success   int `json:"success" yaml:"success"`
 	Failed    int `json:"failed" yaml:"failed"`
 	Cancelled int `json:"cancelled" yaml:"cancelled"`
+	Skipped   int `json:"skipped,omitempty" yaml:"skipped,omitempty"`
 }
 
 // HostResult is the outcome for one host.
@@ -54,6 +55,7 @@ type StepResult struct {
 	Stdout    string          `json:"stdout,omitempty" yaml:"stdout,omitempty"`
 	Stderr    string          `json:"stderr,omitempty" yaml:"stderr,omitempty"`
 	Truncated bool            `json:"output_truncated,omitempty" yaml:"output_truncated,omitempty"`
+	Note      string          `json:"note,omitempty" yaml:"note,omitempty"` // e.g. reboot completed
 	Duration  Duration        `json:"duration" yaml:"duration"`
 	Category  domain.Category `json:"failure_category,omitempty" yaml:"failure_category,omitempty"`
 	Reason    string          `json:"failure_reason,omitempty" yaml:"failure_reason,omitempty"`
@@ -95,6 +97,8 @@ func (r *Report) finish() {
 			r.Summary.Success++
 		case domain.StatusCancelled:
 			r.Summary.Cancelled++
+		case domain.StatusSkipped:
+			r.Summary.Skipped++
 		default:
 			r.Summary.Failed++
 		}
@@ -105,5 +109,9 @@ func (r *Report) finish() {
 func (r *Report) OK() bool { return r.Summary.Success == r.Summary.Total }
 
 func (s Summary) String() string {
-	return fmt.Sprintf("%d hosts: %d succeeded, %d failed, %d cancelled", s.Total, s.Success, s.Failed, s.Cancelled)
+	out := fmt.Sprintf("%d hosts: %d succeeded, %d failed, %d cancelled", s.Total, s.Success, s.Failed, s.Cancelled)
+	if s.Skipped > 0 {
+		out += fmt.Sprintf(", %d skipped", s.Skipped)
+	}
+	return out
 }

@@ -65,6 +65,7 @@ groups:
 
 ```yaml
 name: uptime
+max_failures: "100%"   # read-only, never stop (required field, see below)
 steps:
   - name: uptime
     command: uptime
@@ -119,6 +120,7 @@ connection**, in order. A failing step stops that host unless the step sets
 name: configure-ntp            # required
 description: Install chrony and push its config
 version: "1.2"                 # free text, shown in reports
+max_failures: "5%"             # required: stop starting hosts after 5% failed
 
 variables:
   ntp_server:
@@ -156,6 +158,13 @@ steps:
       not_contains: "503 No such source"
 ```
 
+`max_failures` is required in every job. Once this many hosts have failed
+(`"5"`) or this share of the selected hosts (`"5%"`), no new host is started.
+Hosts already running finish, and the rest are reported as `SKIPPED`. Whoever
+writes the job decides how much breakage is acceptable: `1` for a risky
+database change, `"100%"` (never stop) for read-only fact gathering.
+`--max-failures` on the command line overrides it for one run.
+
 ### Step types
 
 Each step has exactly one of these:
@@ -176,6 +185,10 @@ Each step has exactly one of these:
 | `continue_on_error` | `false` | Record the failure but keep going. The host is still reported as `FAILED`. |
 | `sensitive` | `false` | Mask the command and output in all output (`[SENSITIVE]`). The command is also sent as a temp file, so it never shows up in the remote process list. |
 | `expect` | exit code 0 | See below. |
+| `reboot` | `false` | The command reboots the host. See [Reboots, connection loss and fire-and-forget](#reboots-connection-loss-and-fire-and-forget). |
+| `disconnect` | `false` | The command may drop the SSH connection, e.g. a network or sshd restart. |
+| `reconnect_timeout` | 10m (reboot), 5m (disconnect) | How long to wait for the host to be reachable again. |
+| `fire_and_forget` | `false` | Start the command and stop there. Nothing is checked, and the connection may drop. Must be the last step. |
 
 ### Expectations
 
@@ -191,6 +204,79 @@ expect:
 
 `contains` and `not_contains` search stdout and stderr, including any part
 dropped by the output limit.
+
+### Reboots, connection loss and fire-and-forget
+
+Some commands cut their own SSH connection: `reboot`, a network restart, an
+sshd restart. For a normal step that is a failure. Mark such steps so it is
+expected instead:
+
+```yaml
+steps:
+  - name: reboot
+    command: systemctl reboot
+    reboot: true               # wait until the host is back after the reboot
+    reconnect_timeout: 10m
+
+  - name: restart-network
+    command: systemctl restart systemd-networkd
+    disconnect: true           # the connection may drop; reconnect and continue
+
+  - name: verify
+    command: uname -r          # runs on the fresh connection
+```
+
+- **`reboot: true`**: before the command, `rco` records the host's boot ID
+  (`/proc/sys/kernel/random/boot_id`). A dropped connection counts as success.
+  `rco` then reconnects every 5 seconds until the host answers with a **new**
+  boot ID. The host that is still shutting down is never mistaken for one that is
+  back. The step fails if that does not happen within `reconnect_timeout`.
+- **`disconnect: true`**: a dropped connection counts as success, and `rco`
+  reconnects before the next step. If the connection survived, it simply
+  continues.
+- During these steps SSH keepalives run every 5 seconds. A connection that
+  silently hangs, with no TCP reset, is detected after about 15 seconds
+  instead of waiting for the step timeout.
+- Authentication and host key errors while reconnecting end the wait
+  immediately: they don't fix themselves, and a changed host key must never be
+  retried.
+- A real failure while the connection is alive, such as a non-zero exit code or an
+  unmet expectation, is still a failure. `retries` cannot be combined with these
+  options, because the command must not run twice.
+- The report shows a `note` such as `host rebooted (new boot ID) and was back after 48s`.
+
+`examples/jobs/kernel-update` upgrades packages, reboots and verifies the host.
+
+**Fire and forget.** Some commands should just be started, with no waiting
+and no checking, for example switching the SIM card on a router, which kills
+the uplink the SSH session runs over:
+
+```yaml
+steps:
+  - name: switch-sim
+    command: gsmctl -Y
+    fire_and_forget: true
+```
+
+`rco` starts the command in the background, detached from the SSH session
+(it ignores SIGHUP and has no terminal), so it keeps running when the
+connection drops. The step succeeds as soon as the command has started, and
+the command's exit code and output are never looked at. Because the connection
+may be gone afterwards, a `fire_and_forget` step must be the last step, and it
+cannot be combined with `reboot`, `disconnect`, `retries`, `sensitive` or
+`expect`.
+
+### OpenWrt and other minimal systems
+
+`rco` needs only a POSIX shell and busybox tools on the host. It works with
+dropbear and was tested against OpenWrt 23.05. On OpenWrt:
+
+- Log in as `root` and don't use `sudo`, which isn't installed.
+- Use `command:` steps. `script:` steps run with `bash`, which OpenWrt doesn't ship.
+- `copy:` works: it needs only `mktemp`, `cp`, `chmod` and `mv`.
+
+`examples/jobs/openwrt-sim-switch` switches the SIM on Teltonika RutOS routers,
+with `examples/inventories/prod/routers.yaml`.
 
 ### Variables
 
@@ -328,6 +414,10 @@ rco run --inventory inventories/prod/hosts.yaml --job jobs/configure-ntp --execu
   in `jobs/test/` and `jobs/prod/` would drift apart, and prod would run
   something other than what was tested. The `hash` in the report shows that test
   and prod ran exactly the same job.
+- Shared settings can live in a separate file. Repeat `-i` to combine files:
+  `-i inventories/common.yaml -i inventories/prod/hosts.yaml`. Credentials,
+  bastions, groups and hosts from all files are merged. A name defined in two
+  files is an error, never a silent override, and `defaults` may be set in one file only.
 - Use tags **within** an environment to pick a subset, such as `--tag canary`.
   Keeping environments as groups or tags in one file also works, but a forgotten
   selector then selects every host, prod included.
@@ -380,36 +470,35 @@ warning. Never use it on networks you don't control.
 ## Running
 
 ```text
-rco run --inventory FILE --job JOB [selectors] [options]
+rco run      -i INVENTORY -j JOB [selectors] [options]              preview only
+rco run      -i INVENTORY -j JOB [selectors] [options] --execute    apply changes
+rco validate -j JOB [-i INVENTORY [selectors]]                      check without connecting
 
-  JOB is a job directory (containing job.yaml) or a job YAML file.
-
-  -i, --inventory FILE       inventory file
-  -j, --job JOB              job directory or file
-  -g, --group NAME           select hosts in group (repeatable)
-  -t, --tag NAME             select hosts with tag (repeatable)
-  -H, --host NAME            select host by name (repeatable)
-
-      --execute              actually run the job; without it rco only prints a
-                             preview per host and connects to nothing
-
-      --var NAME=VALUE       job variable (repeatable)
-      --var-env NAME=ENV_VAR job variable read from the environment (repeatable)
-  -c, --concurrency N        hosts processed at the same time (default 100)
-      --timeout D            default step timeout (default 5m)
-      --connect-timeout D    TCP connect timeout (default 10s)
-      --handshake-timeout D  SSH handshake + auth timeout (default 15s)
-      --connect-retries N    extra attempts for transient connection errors (default 2)
-      --retry-delay D        base retry delay, exponential with jitter (default 2s)
-      --max-retry-delay D    cap for connection retry delay (default 30s)
-      --max-output BYTES     stdout/stderr kept per step (default 1 MiB)
-      --known-hosts FILE     known_hosts file (default ~/.ssh/known_hosts)
-      --accept-new-host-keys add keys of unknown hosts to known_hosts; changed keys still fail
-      --insecure-skip-host-key-check
-  -o, --output FORMAT        stdout format: table, json or yaml (default table)
-      --report FILE          also write the full report (.json/.yaml)
-  -v, --verbose              table: show every step with its output
-  -q, --quiet                log warnings and errors only
+  -i, --inventory FILE                inventory FILE; repeat to combine files (e.g. common.yaml + prod.yaml)
+  -j, --job JOB                       JOB directory (with job.yaml) or job YAML file
+  -g, --group NAME                    select hosts in group NAME (repeatable)
+  -t, --tag NAME                      select hosts with tag NAME (repeatable)
+  -H, --host NAME                     select host NAME (repeatable)
+      --execute                       actually run the job; without it rco only previews, connecting to nothing
+      --var NAME=VALUE                job variable NAME=VALUE (repeatable)
+      --var-env NAME=ENV_VAR          job variable NAME=ENV_VAR read from the environment; required for sensitive variables (repeatable)
+  -c, --concurrency N                 maximum hosts processed at the same time (default 100)
+      --max-failures N                override the job's max_failures: stop starting new hosts after N failed hosts, or N% of all hosts; the rest are SKIPPED
+      --only-failed REPORT            run only on hosts that did not succeed in a previous REPORT (.json, .yaml or .jsonl)
+      --timeout DURATION              default per-step timeout (job file values win) (default 5m0s)
+      --connect-timeout DURATION      TCP connect timeout (default 10s)
+      --handshake-timeout DURATION    SSH handshake and authentication timeout (default 15s)
+      --connect-retries N             extra connection attempts for transient failures (never for auth or host key errors) (default 2)
+      --retry-delay DURATION          base delay between retries (exponential with jitter) (default 2s)
+      --max-retry-delay DURATION      maximum delay between connection retries (default 30s)
+      --max-output BYTES              BYTES of stdout/stderr kept per step (head and tail are kept) (default 1048576)
+      --known-hosts FILE              known_hosts FILE used to verify host keys (default ~/.ssh/known_hosts)
+      --accept-new-host-keys          add keys of hosts missing from known_hosts (trust on first use); changed keys still fail
+      --insecure-skip-host-key-check  INSECURE: do not verify host keys (lab use only)
+  -o, --output FORMAT                 result FORMAT on stdout: table, json or yaml (default table)
+      --report FILE                   also write the full report to FILE (.json, .yaml; .jsonl is written host by host as results arrive)
+  -v, --verbose                       table output: include every step with its output
+  -q, --quiet                         log only warnings and errors (hides progress)
 ```
 
 - Every flag also works with a single dash (`-execute`). `--execute` has no
@@ -419,7 +508,7 @@ rco run --inventory FILE --job JOB [selectors] [options]
   or reading any key or password.
 - **stdout** carries results only and **stderr** carries logs, so `rco run ... --execute --output json | jq` works.
 - **Exit codes**: `0` means every host succeeded, `2` means the run finished but some host
-  failed or was cancelled, and `1` means a usage, validation or file error, in which case no host was contacted.
+  failed, was skipped (`max_failures`) or cancelled, and `1` means a usage, validation or file error, in which case no host was contacted.
 - **Connection retries** apply only to transient errors: timeouts, refused
   connections, broken handshakes. Authentication, host key and DNS errors fail
   immediately.
@@ -456,10 +545,49 @@ without connecting.
 `hash` is the SHA-256 of the job file plus every script and uploaded file, so a
 report identifies exactly what ran. Report files are created with mode 0600.
 
+With a `.jsonl` file name, `--report` writes one JSON line per host **as soon
+as the host finishes**, then a final line with the summary. If `rco` itself is
+killed halfway, the finished hosts are already on disk.
+
 Failure categories: `CONNECTION_TIMEOUT`, `CONNECTION_REFUSED`, `DNS_FAILURE`,
 `AUTH_FAILED`, `HOST_KEY_MISMATCH`, `HOST_KEY_UNKNOWN`, `SSH_HANDSHAKE_FAILED`,
 `SESSION_FAILED`, `COMMAND_TIMEOUT`, `COMMAND_FAILED`, `TEMPLATE_ERROR`,
 `CANCELLED`, `INTERNAL_ERROR`.
+
+## Large fleets
+
+`rco` handles thousands of hosts in one run. The hosts form a queue:
+`--concurrency` of them (default 100) run at once, and each finished host
+frees its slot for the next one. Nothing is started early and nothing is
+dropped. Only hosts that currently hold a slot have an open connection.
+
+```bash
+# 1. canaries first
+rco run -i prod/hosts.yaml -j jobs/x -t canary --execute
+# 2. everything (the job's max_failures applies), stream the report
+rco run -i prod/hosts.yaml -j jobs/x --execute -c 300 --report run.jsonl
+# 3. after fixing the cause: only the hosts that did not succeed
+rco run -i prod/hosts.yaml -j jobs/x --execute --only-failed run.jsonl --report run2.jsonl
+```
+
+- **`max_failures`** (required in every job, `--max-failures` overrides it):
+  once that many hosts have failed, no new hosts are started. A broken job then
+  stops after a handful of hosts instead of hitting all 30 000.
+- **`--only-failed REPORT`** reruns only the hosts that were not `SUCCESS` in a
+  previous `.json`, `.yaml` or `.jsonl` report. Selectors still apply.
+- **Progress**: every 10 seconds `rco` logs `done`, `total`, `running`, `failed`
+  and an `eta` to stderr. Each finished host is logged too. `-q` hides both.
+- **Duration** is roughly `hosts / concurrency × time per host`. For example,
+  15 000 hosts at 5 s each take about 12.5 minutes with `-c 100` and about 4 minutes with `-c 300`.
+- **Memory**: results are kept until the end of the run. With short command
+  output that is a few KB per host. For chatty commands, lower `--max-output`
+  (for example `16384`).
+- **Bastions**: every host behind a bastion is a separate SSH connection
+  through it. OpenSSH's default `MaxStartups 10:30:100` starts refusing
+  connections above about 10 concurrent logins. Use `-c 10` or raise `MaxStartups`
+  on the bastion.
+- **Inventory size**: up to 64 MiB per file, and files can be split and
+  combined with repeated `-i`.
 
 ## How it works
 
@@ -486,6 +614,7 @@ flowchart LR
 ```bash
 make check    # gofmt, go vet, go test -race, go build (same as CI)
 make lint     # golangci-lint
+make vuln     # govulncheck: known vulnerabilities in reachable code
 make build    # bin/rco
 ```
 

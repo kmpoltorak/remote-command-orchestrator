@@ -231,8 +231,11 @@ func (d *Dialer) handshake(ctx context.Context, conn net.Conn, hop Hop) (*ssh.Cl
 	stop()
 	if err != nil {
 		_ = conn.Close()
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
 			return nil, domain.Fail(domain.CatCancelled, "cancelled during SSH handshake with %s", hop.Addr)
+		}
+		if ctx.Err() != nil { // a deadline, not the user: report it as a timeout
+			return nil, domain.Fail(domain.CatHandshakeFailed, "SSH handshake with %s timed out", hop.Addr)
 		}
 		return nil, ClassifyHandshake(err, hop.Addr, timedOut.Load())
 	}

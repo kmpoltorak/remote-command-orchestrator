@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X github.com/kmpoltorak/remote-command-orchestrator/internal/cli.Version=$(VERSION)
 
-.PHONY: build test race lint fmt check clean
+.PHONY: build test race lint vuln fmt check clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/rco ./cmd/rco
@@ -14,6 +14,10 @@ race:
 
 lint:
 	golangci-lint run
+
+# Known vulnerabilities in dependencies and the Go toolchain that our code actually calls.
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 fmt:
 	gofmt -w .

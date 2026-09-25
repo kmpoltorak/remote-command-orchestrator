@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -44,6 +45,7 @@ hosts:
 	os.WriteFile(f.job, []byte(`
 name: cli-test
 version: "1.0"
+max_failures: "100%"
 variables: {color: {default: none}}
 steps:
   - {name: greet, command: "echo color={{ .color }}"}
@@ -144,6 +146,75 @@ func TestShortAliases(t *testing.T) {
 	}
 	if code, out, _ := main(t, "run", "-i", f.inv, "-j", f.job, "-H", "other", "-v"); code != ExitOK || !strings.Contains(out, "preview: 1 hosts") {
 		t.Fatalf("bool alias -v: %d %s", code, out)
+	}
+}
+
+func TestHelpListsEveryFlag(t *testing.T) {
+	code, out, _ := main(t, "help")
+	if code != ExitOK {
+		t.Fatal(code)
+	}
+	newFlags("x").fs.VisitAll(func(f *flag.Flag) {
+		if f.Usage == "alias" {
+			if !strings.Contains(out, "-"+f.Name+", --") {
+				t.Errorf("alias -%s missing from help", f.Name)
+			}
+			return
+		}
+		if !strings.Contains(out, "--"+f.Name+" ") && !strings.Contains(out, "--"+f.Name+"\t") && !strings.Contains(out, "--"+f.Name+"  ") {
+			t.Errorf("--%s missing from help", f.Name)
+		}
+	})
+	if !strings.Contains(out, "--timeout DURATION") || !strings.Contains(out, "-c, --concurrency N") {
+		t.Errorf("value names:\n%s", out)
+	}
+}
+
+func TestMaxFailuresFromJobAndOverride(t *testing.T) {
+	f := setup(t)
+	os.WriteFile(f.job, bytes.Replace(mustRead(f.job), []byte(`max_failures: "100%"`), []byte(`max_failures: 1`), 1), 0o600)
+	// The job's max_failures is applied (skipping itself is covered in the runner tests).
+	code, stdout, _ := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known, "-c", "1", "-o", "json", "-q")
+	var r runner.Report
+	if code != ExitHostsFailed || json.Unmarshal([]byte(stdout), &r) != nil || r.Summary.Failed != 1 {
+		t.Fatalf("%d %+v", code, r.Summary)
+	}
+	// Preview shows the effective limit; the flag overrides the job.
+	_, out, _ := main(t, "run", "-i", f.inv, "-j", f.job, "--max-failures", "50%")
+	if !strings.Contains(out, "stop after 2 failed hosts") {
+		t.Fatalf("override: %s", out)
+	}
+	if code, _, stderr := main(t, "run", "-i", f.inv, "-j", f.job, "--max-failures", "0"); code != ExitError || !strings.Contains(stderr, "max failures") {
+		t.Fatalf("invalid override must fail: %d %s", code, stderr)
+	}
+}
+
+func mustRead(p string) []byte { b, _ := os.ReadFile(p); return b }
+
+func TestJSONLReportAndOnlyFailed(t *testing.T) {
+	f := setup(t)
+	rep := filepath.Join(f.dir, "run.jsonl")
+	code, _, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known, "--report", rep, "-q")
+	if code != ExitHostsFailed {
+		t.Fatalf("web-02 fails: %d %s", code, stderr)
+	}
+	data, _ := os.ReadFile(rep)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 4 || !strings.Contains(lines[3], `"summary"`) {
+		t.Fatalf("want 3 host lines + summary:\n%s", data)
+	}
+	// Rerun only what did not succeed (web-02 still fails: inventory variables win).
+	code, stdout, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known,
+		"--only-failed", rep, "-o", "json", "-q")
+	var r runner.Report
+	if code != ExitHostsFailed || json.Unmarshal([]byte(stdout), &r) != nil || r.Summary.Total != 1 || r.Hosts[0].Host != "web-02" {
+		t.Fatalf("%d %s %s", code, stdout, stderr)
+	}
+	// A preview must not leave an empty report behind.
+	os.Remove(rep)
+	main(t, "run", "-i", f.inv, "-j", f.job, "--report", rep)
+	if _, err := os.Stat(rep); err == nil {
+		t.Fatal("preview must not create a .jsonl report")
 	}
 }
 

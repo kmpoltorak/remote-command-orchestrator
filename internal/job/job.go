@@ -9,9 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,9 +33,13 @@ const (
 
 // Job is a parsed job file.
 type Job struct {
-	Name        string              `yaml:"name" json:"name"`
-	Description string              `yaml:"description" json:"description,omitempty"`
-	Version     string              `yaml:"version" json:"version,omitempty"`
+	Name        string `yaml:"name" json:"name"`
+	Description string `yaml:"description" json:"description,omitempty"`
+	Version     string `yaml:"version" json:"version,omitempty"`
+	// MaxFailures is required: after this many failed hosts ("5") or this
+	// share of the selected hosts ("1%") no new host is started. "100%" means
+	// never stop. The job author decides how much breakage is acceptable.
+	MaxFailures string              `yaml:"max_failures" json:"max_failures"`
 	Variables   map[string]Variable `yaml:"variables" json:"variables,omitempty"`
 	Defaults    Defaults            `yaml:"defaults" json:"defaults"`
 	Steps       []Step              `yaml:"steps" json:"steps"`
@@ -73,6 +80,16 @@ type Step struct {
 	RetryDelay      time.Duration `yaml:"retry_delay" json:"retry_delay,omitempty"`
 	ContinueOnError bool          `yaml:"continue_on_error" json:"continue_on_error,omitempty"`
 	Sensitive       bool          `yaml:"sensitive" json:"sensitive,omitempty"`
+	// Reboot: the command reboots the host. Losing the connection is expected;
+	// rco waits until the host is back with a new boot ID.
+	Reboot bool `yaml:"reboot" json:"reboot,omitempty"`
+	// Disconnect: the command may drop the connection (network or sshd
+	// restart). That is not an error; rco reconnects before the next step.
+	Disconnect       bool          `yaml:"disconnect" json:"disconnect,omitempty"`
+	ReconnectTimeout time.Duration `yaml:"reconnect_timeout" json:"reconnect_timeout,omitempty"`
+	// FireAndForget: start the command and stop there. The connection may
+	// drop, nothing is checked (e.g. gsmctl -Y switching the SIM card).
+	FireAndForget bool `yaml:"fire_and_forget" json:"fire_and_forget,omitempty"`
 
 	scriptBody []byte
 }
@@ -225,6 +242,11 @@ func (j *Job) Validate() error {
 	if !namePattern.MatchString(j.Name) {
 		add("name is required and must match %s", namePattern)
 	}
+	if j.MaxFailures == "" {
+		add(`max_failures is required: e.g. "5" hosts, "1%%" of hosts, or "100%%" to never stop`)
+	} else if _, err := ParseMaxFailures(j.MaxFailures, 1); err != nil {
+		add("max_failures: %v", err)
+	}
 	if j.Defaults.Timeout < 0 || j.Defaults.Timeout > MaxTimeout || j.Defaults.RetryDelay < 0 {
 		add("defaults: timeout must be 0-%s and retry_delay >= 0", MaxTimeout)
 	}
@@ -283,6 +305,27 @@ func (j *Job) Validate() error {
 		if s.Retries != nil && (*s.Retries < 0 || *s.Retries > MaxRetries) {
 			add("%s: retries must be 0-%d", loc, MaxRetries)
 		}
+		if s.Reboot || s.Disconnect {
+			if s.Copy != nil {
+				add("%s: reboot/disconnect apply to command and script steps", loc)
+			}
+			if s.Retries != nil && *s.Retries > 0 {
+				add("%s: retries cannot be combined with reboot/disconnect (the command must not run twice)", loc)
+			}
+		}
+		if s.FireAndForget {
+			switch {
+			case s.Command == "":
+				add("%s: fire_and_forget applies to command steps", loc)
+			case i != len(j.Steps)-1:
+				add("%s: fire_and_forget must be the last step (the connection may be gone afterwards)", loc)
+			case s.Reboot || s.Disconnect || s.Retries != nil || s.Sensitive || !reflect.DeepEqual(s.Expect, Expect{}):
+				add("%s: fire_and_forget checks nothing, so it cannot be combined with reboot, disconnect, retries, sensitive or expect", loc)
+			}
+		}
+		if s.ReconnectTimeout < 0 || s.ReconnectTimeout > MaxTimeout || (s.ReconnectTimeout > 0 && !s.Reboot && !s.Disconnect) {
+			add("%s: reconnect_timeout needs reboot or disconnect and must be 0-%s", loc, MaxTimeout)
+		}
 		e := s.Expect
 		if e.ExitCode != nil && (*e.ExitCode < 0 || *e.ExitCode > 255) {
 			add("%s: expect.exit_code must be 0-255", loc)
@@ -333,4 +376,20 @@ func (j *Job) checkRefs(text, loc string, allowSensitive bool) []string {
 		}
 	}
 	return issues
+}
+
+// ParseMaxFailures turns "N" or "N%" into a number of hosts for a run over
+// total hosts. A percentage rounds up and is at least 1.
+func ParseMaxFailures(v string, total int) (int, error) {
+	pct := strings.HasSuffix(v, "%")
+	n, err := strconv.ParseFloat(strings.TrimSuffix(v, "%"), 64)
+	switch {
+	case err != nil || n <= 0 || (pct && n > 100):
+		return 0, fmt.Errorf("%q: want a positive number of hosts or a percentage like 5%%", v)
+	case pct:
+		return max(1, int(math.Ceil(n*float64(total)/100))), nil
+	case n != math.Trunc(n):
+		return 0, fmt.Errorf("%q: want a whole number of hosts", v)
+	}
+	return int(n), nil
 }

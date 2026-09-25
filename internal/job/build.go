@@ -24,24 +24,34 @@ const (
 // keeps stdin of a sudo command reserved for the sudo password, so the
 // password can never leak into a script or a file when sudo does not prompt.
 type Action struct {
-	Name            string
-	Kind            string
-	Display         string // what reports show; [SENSITIVE] for sensitive steps
-	Shell           string // KindCommand: rendered command
-	Content         []byte // KindScript / KindCopy: bytes to upload (never shown)
-	Dest            string // KindCopy
-	Mode            string // KindCopy
-	Sudo            bool
-	ExitCode        int
-	Contains        []string
-	NotContains     []string
-	Regex           *regexp.Regexp
-	Timeout         time.Duration
-	Retries         int
-	RetryDelay      time.Duration
-	ContinueOnError bool
-	Sensitive       bool
+	Name             string
+	Kind             string
+	Display          string // what reports show; [SENSITIVE] for sensitive steps
+	Shell            string // KindCommand: rendered command
+	Content          []byte // KindScript / KindCopy: bytes to upload (never shown)
+	Dest             string // KindCopy
+	Mode             string // KindCopy
+	Sudo             bool
+	ExitCode         int
+	Contains         []string
+	NotContains      []string
+	Regex            *regexp.Regexp
+	Timeout          time.Duration
+	Retries          int
+	RetryDelay       time.Duration
+	ContinueOnError  bool
+	Sensitive        bool
+	Reboot           bool          // wait for the host to come back with a new boot ID
+	Disconnect       bool          // connection loss is expected (always true with Reboot)
+	ReconnectTimeout time.Duration // how long to wait for the host to be reachable again
+	FireAndForget    bool          // start in the background and check nothing
 }
+
+// Default reconnect timeouts.
+const (
+	DefaultRebootTimeout     = 10 * time.Minute
+	DefaultDisconnectTimeout = 5 * time.Minute
+)
 
 // UploadCommand stores stdin in a new 0600 temp file and prints its path.
 const UploadCommand = `umask 077 && t=$(mktemp) && cat > "$t" && printf '%s' "$t"`
@@ -64,6 +74,11 @@ func (a Action) Remote(tmp string, sudoPassword bool) string {
 		return cleanup(wrap("bash "+Quote(tmp)), tmp)
 	case a.Kind == KindCommand && a.Content != nil: // sensitive command, see build
 		return cleanup(wrap("sh "+Quote(tmp)), tmp)
+	case a.FireAndForget:
+		// The subshell ignores SIGHUP and drops the session's stdio, so the
+		// command keeps running when the connection closes; the launcher
+		// itself exits at once. POSIX sh only (works with busybox ash).
+		return wrap(fmt.Sprintf("(trap '' HUP; %s) </dev/null >/dev/null 2>&1 &", a.Shell))
 	case a.Kind == KindCopy:
 		// Copy to a temp name beside dest, then rename: readers never see a
 		// partial file, and the file is owned by the (sudo) user doing the copy.
@@ -106,6 +121,15 @@ func (j *Job) build(st Step, vars map[string]string, s Settings) (Action, error)
 		RetryDelay:      first(st.RetryDelay, j.Defaults.RetryDelay, s.RetryDelay),
 		ContinueOnError: st.ContinueOnError,
 		Sensitive:       st.Sensitive,
+		Reboot:          st.Reboot,
+		Disconnect:      st.Reboot || st.Disconnect,
+		FireAndForget:   st.FireAndForget,
+	}
+	if a.Disconnect {
+		a.ReconnectTimeout = first(st.ReconnectTimeout, DefaultDisconnectTimeout)
+		if a.Reboot {
+			a.ReconnectTimeout = first(st.ReconnectTimeout, DefaultRebootTimeout)
+		}
 	}
 	if st.Sudo != nil {
 		a.Sudo = *st.Sudo

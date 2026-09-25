@@ -1,0 +1,27 @@
+name: kernel-update
+description: Upgrade packages, reboot, and verify the host came back healthy
+version: "1.0"
+max_failures: 2   # reboots hosts: stop after 2 failures
+
+defaults:
+  sudo: true
+  timeout: 15m
+
+steps:
+  - name: upgrade
+    command: DEBIAN_FRONTEND=noninteractive apt-get update -q && apt-get -y -q dist-upgrade
+
+  - name: reboot
+    command: systemctl reboot
+    reboot: true               # connection loss is expected; rco waits for a new boot ID
+    reconnect_timeout: 10m     # default for reboot steps
+
+  - name: verify-kernel
+    sudo: false
+    command: uname -r
+
+  - name: verify-services
+    sudo: false
+    command: systemctl is-system-running --wait
+    expect:
+      not_contains: degraded

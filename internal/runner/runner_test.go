@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,6 +48,9 @@ func loadJob(t *testing.T, yaml string, files map[string]string) *job.Job {
 	dir := t.TempDir()
 	for name, body := range files {
 		os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600)
+	}
+	if !strings.Contains(yaml, "max_failures") {
+		yaml = "max_failures: \"100%\"\n" + strings.TrimLeft(yaml, "\n") // these tests are not about it
 	}
 	p := filepath.Join(dir, "job.yaml")
 	os.WriteFile(p, []byte(yaml), 0o600)
@@ -300,6 +305,42 @@ func TestBoundedConcurrencyManyHosts(t *testing.T) {
 	}
 }
 
+func TestMaxFailuresAndProgress(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	var targets []domain.Target
+	for i := range 40 {
+		targets = append(targets, target(fmt.Sprintf("h%02d", i), srv))
+	}
+	j := loadJob(t, "name: bad\nsteps: [{name: s, command: 'sleep 0.05; exit 1'}]", nil)
+	o := opts(sshtest.WriteKnownHosts(t, srv))
+	o.Concurrency, o.MaxFailures, o.Progress = 4, 5, 20*time.Millisecond
+	var logs strings.Builder
+	var mu sync.Mutex
+	o.Logger = slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return logs.Write(p) }), nil))
+	var streamed atomic.Int64
+	o.OnHostDone = func(HostResult) { streamed.Add(1) }
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: targets}, o)
+	// Up to MaxFailures + (Concurrency-1) hosts can fail: those already running finish.
+	if rep.Summary.Failed < 5 || rep.Summary.Failed > 8 || rep.Summary.Skipped != 40-rep.Summary.Failed {
+		t.Fatalf("%+v", rep.Summary)
+	}
+	if streamed.Load() != 40 {
+		t.Fatalf("OnHostDone called %d times", streamed.Load())
+	}
+	if !strings.Contains(rep.Hosts[39].Reason, "--max-failures 5") || !strings.Contains(rep.Summary.String(), "skipped") {
+		t.Fatalf("%+v", rep.Hosts[39])
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(logs.String(), "msg=progress") {
+		t.Fatal("no progress log")
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
 func TestCancellation(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
 	var targets []domain.Target
@@ -337,5 +378,132 @@ func TestBastionRun(t *testing.T) {
 	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{tg}}, opts(sshtest.WriteKnownHosts(t, inner, bastion)))
 	if s := rep.Hosts[0].Steps[0]; s.Stdout != "inside" {
 		t.Fatalf("%+v", rep.Hosts[0])
+	}
+}
+
+// fastReconnect shortens the reboot/disconnect timings for tests and makes the
+// boot ID come from the test server's simulated boot_id file.
+func fastReconnect(t *testing.T) {
+	oldCmd, oldDelay, oldKA := bootIDCommand, reconnectDelay, keepaliveInterval
+	bootIDCommand, reconnectDelay, keepaliveInterval = "cat boot_id", 50*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { bootIDCommand, reconnectDelay, keepaliveInterval = oldCmd, oldDelay, oldKA })
+}
+
+func statuses(h HostResult) string {
+	var s []string
+	for _, st := range h.Steps {
+		s = append(s, string(st.Status))
+	}
+	return strings.Join(s, ",")
+}
+
+func TestRebootStep(t *testing.T) {
+	fastReconnect(t)
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	before := srv.BootID()
+	j := loadJob(t, `
+name: reboot
+steps:
+  - {name: before, command: "echo up"}
+  - {name: reboot, command: "rco-test-reboot 400ms", reboot: true}
+  - {name: after, command: "cat boot_id"}
+`, nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	h := rep.Hosts[0]
+	if h.Status != domain.StatusSuccess || statuses(h) != "SUCCESS,SUCCESS,SUCCESS" {
+		t.Fatalf("%s %+v", statuses(h), h)
+	}
+	if !strings.Contains(h.Steps[1].Note, "rebooted") || h.Steps[2].Stdout == strings.TrimSpace(before) {
+		t.Fatalf("after-reboot step must run on the rebooted host: %+v", h.Steps)
+	}
+	if srv.Conns.Load() != 2 {
+		t.Fatalf("want initial + one reconnect, got %d connections", srv.Conns.Load())
+	}
+}
+
+func TestRebootHostDoesNotComeBack(t *testing.T) {
+	fastReconnect(t)
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, `
+name: reboot
+steps:
+  - {name: reboot, command: "rco-test-reboot 1h", reboot: true, reconnect_timeout: 400ms}
+  - {name: after, command: "true"}
+`, nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	h := rep.Hosts[0]
+	if h.Status != domain.StatusFailed || h.FailedStep != "reboot" || !strings.Contains(h.Reason, "did not come back within 400ms") || statuses(h) != "FAILED,SKIPPED" {
+		t.Fatalf("%s %+v", statuses(h), h)
+	}
+}
+
+func TestRebootRequiresNewBootID(t *testing.T) {
+	fastReconnect(t)
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	// The connection drops but the host never reboots: the old boot ID must
+	// not be mistaken for a host that is back.
+	j := loadJob(t, "name: r\nsteps: [{name: reboot, command: rco-test-drop, reboot: true, reconnect_timeout: 500ms}]", nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	if h := rep.Hosts[0]; h.Status != domain.StatusFailed || !strings.Contains(h.Reason, "was not rebooted within 500ms") {
+		t.Fatalf("%+v", h)
+	}
+}
+
+func TestDisconnectStep(t *testing.T) {
+	fastReconnect(t)
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, `
+name: net
+steps:
+  - {name: restart-network, command: rco-test-drop, disconnect: true}
+  - {name: quick-restart, command: "true", disconnect: true}
+  - {name: after, command: "echo still-here"}
+`, nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	h := rep.Hosts[0]
+	if h.Status != domain.StatusSuccess || statuses(h) != "SUCCESS,SUCCESS,SUCCESS" || h.Steps[2].Stdout != "still-here" {
+		t.Fatalf("%s %+v", statuses(h), h)
+	}
+	if !strings.Contains(h.Steps[0].Note, "closed as expected") || h.Steps[1].Note != "" {
+		t.Fatalf("notes: %q / %q", h.Steps[0].Note, h.Steps[1].Note)
+	}
+	if srv.Conns.Load() != 2 {
+		t.Fatalf("one reconnect after the drop, none after the quick restart; got %d connections", srv.Conns.Load())
+	}
+}
+
+func TestFireAndForget(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, `
+name: ff
+steps:
+  - {name: before, command: "echo up"}
+  - {name: switch, command: "sleep 1; echo switched > marker; exit 3", fire_and_forget: true}
+`, nil)
+	start := time.Now()
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	h := rep.Hosts[0]
+	// Success means "started": the exit code 3 and the output are never looked at.
+	if h.Status != domain.StatusSuccess || !strings.Contains(h.Steps[1].Note, "fire and forget") || time.Since(start) > 900*time.Millisecond {
+		t.Fatalf("must return without waiting for the command: %s %+v", time.Since(start), h)
+	}
+	// The command keeps running after rco closed the connection.
+	marker := filepath.Join(srv.Dir, "marker")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(b)) == "switched" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("background command did not complete after the connection closed")
+}
+
+func TestUnexpectedDisconnectIsAFailure(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, "name: n\nsteps: [{name: s, command: rco-test-drop}, {name: after, command: 'true'}]", nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	if h := rep.Hosts[0]; h.Status != domain.StatusFailed || statuses(h) != "FAILED,SKIPPED" {
+		t.Fatalf("%s %+v", statuses(h), h)
 	}
 }

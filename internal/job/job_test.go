@@ -40,21 +40,31 @@ func TestValidationErrors(t *testing.T) {
 	cases := map[string]string{
 		"yaml":              "name: [",
 		"no name":           "steps: [{name: a, command: x}]",
-		"no steps":          "name: a",
-		"duplicate":         "name: a\nsteps: [{name: s, command: x}, {name: s, command: y}]",
-		"two kinds":         "name: a\nsteps: [{name: s, command: x, script: y.sh}]",
-		"no kind":           "name: a\nsteps: [{name: s}]",
-		"bad regex":         "name: a\nsteps: [{name: s, command: x, expect: {regex: '(['}}]",
-		"bad timeout":       "name: a\nsteps: [{name: s, command: x, timeout: 5parsecs}]",
-		"retries":           "name: a\nsteps: [{name: s, command: x, retries: 11}]",
-		"undeclared var":    "name: a\nsteps: [{name: s, command: 'echo {{ .x }}'}]",
-		"template func":     "name: a\nvariables: {x: {}}\nsteps: [{name: s, command: '{{ printf .x }}'}]",
-		"unknown field":     "name: a\nsteps: [{name: s, command: x, expcet: {}}]",
-		"sensitive leak":    "name: a\nvariables: {pw: {sensitive: true}}\nsteps: [{name: s, command: 'echo {{ .pw }}'}]",
-		"relative dest":     "name: a\nsteps: [{name: s, copy: {src: f, dest: etc/x}}]",
-		"bad mode":          "name: a\nsteps: [{name: s, copy: {src: f, dest: /etc/x, mode: '999'}}]",
-		"exit code range":   "name: a\nsteps: [{name: s, command: x, expect: {exit_code: 300}}]",
-		"sensitive default": "name: a\nvariables: {pw: {sensitive: true, default: x}}\nsteps: [{name: s, command: x}]",
+		"no steps":          "name: a\nmax_failures: 1",
+		"duplicate":         "name: a\nmax_failures: 1\nsteps: [{name: s, command: x}, {name: s, command: y}]",
+		"two kinds":         "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, script: y.sh}]",
+		"no kind":           "name: a\nmax_failures: 1\nsteps: [{name: s}]",
+		"bad regex":         "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, expect: {regex: '(['}}]",
+		"bad timeout":       "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, timeout: 5parsecs}]",
+		"retries":           "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, retries: 11}]",
+		"undeclared var":    "name: a\nmax_failures: 1\nsteps: [{name: s, command: 'echo {{ .x }}'}]",
+		"template func":     "name: a\nmax_failures: 1\nvariables: {x: {}}\nsteps: [{name: s, command: '{{ printf .x }}'}]",
+		"unknown field":     "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, expcet: {}}]",
+		"sensitive leak":    "name: a\nmax_failures: 1\nvariables: {pw: {sensitive: true}}\nsteps: [{name: s, command: 'echo {{ .pw }}'}]",
+		"relative dest":     "name: a\nmax_failures: 1\nsteps: [{name: s, copy: {src: f, dest: etc/x}}]",
+		"bad mode":          "name: a\nmax_failures: 1\nsteps: [{name: s, copy: {src: f, dest: /etc/x, mode: '999'}}]",
+		"exit code range":   "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, expect: {exit_code: 300}}]",
+		"sensitive default": "name: a\nmax_failures: 1\nvariables: {pw: {sensitive: true, default: x}}\nsteps: [{name: s, command: x}]",
+		"reboot copy":       "name: a\nmax_failures: 1\nsteps: [{name: s, reboot: true, copy: {src: f, dest: /x}}]",
+		"reboot retries":    "name: a\nmax_failures: 1\nsteps: [{name: s, command: reboot, reboot: true, retries: 1}]",
+		"no max_failures":   "name: a\nsteps: [{name: s, command: x}]",
+		"bad max_failures":  "name: a\nmax_failures: 0\nsteps: [{name: s, command: x}]",
+		"max_failures pct":  "name: a\nmax_failures: 150%\nsteps: [{name: s, command: x}]",
+		"ff not last":       "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, fire_and_forget: true}, {name: t, command: y}]",
+		"ff with expect":    "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, fire_and_forget: true, expect: {contains: ok}}]",
+		"ff with reboot":    "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, fire_and_forget: true, reboot: true}]",
+		"ff script":         "name: a\nmax_failures: 1\nsteps: [{name: s, script: x.sh, fire_and_forget: true}]",
+		"orphan reconnect":  "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, reconnect_timeout: 1m}]",
 	}
 	for name, doc := range cases {
 		var ve *ValidationError
@@ -67,7 +77,7 @@ func TestValidationErrors(t *testing.T) {
 func TestLoadMissingFiles(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "j.yaml")
-	os.WriteFile(p, []byte("name: a\nsteps: [{name: s, script: nope.sh}, {name: c, copy: {src: nope, dest: /x}}]"), 0o600)
+	os.WriteFile(p, []byte("name: a\nmax_failures: 1\nsteps: [{name: s, script: nope.sh}, {name: c, copy: {src: nope, dest: /x}}]"), 0o600)
 	_, err := Load(p)
 	if err == nil || !strings.Contains(err.Error(), "nope.sh") || !strings.Contains(err.Error(), `"c"`) {
 		t.Fatalf("got %v", err)
@@ -91,6 +101,7 @@ func TestReferencesAndRender(t *testing.T) {
 
 const demo = `
 name: demo
+max_failures: 1
 variables:
   iface: {required: true}
   site: {default: dc1}
@@ -140,6 +151,7 @@ func TestBuild(t *testing.T) {
 	p := filepath.Join(dir, "job.yaml")
 	os.WriteFile(p, []byte(`
 name: b
+max_failures: 10%
 variables: {srv: {}, pw: {sensitive: true}}
 defaults: {timeout: 5s, sudo: true}
 steps:
@@ -180,8 +192,49 @@ steps:
 	}
 }
 
+func TestParseMaxFailures(t *testing.T) {
+	cases := map[string]int{"3": 3, "10%": 100, "0.1%": 1, "100%": 1000}
+	for in, want := range cases {
+		if got, err := ParseMaxFailures(in, 1000); err != nil || got != want {
+			t.Errorf("%q: got %d %v, want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "0", "-1", "abc", "101%", "2.5"} {
+		if _, err := ParseMaxFailures(bad, 1000); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}
+
 func TestQuote(t *testing.T) {
 	if got := Quote(`it's`); got != `'it'\''s'` {
 		t.Fatal(got)
+	}
+}
+
+func TestRebootAndDisconnectDefaults(t *testing.T) {
+	j, err := Parse([]byte(`
+name: r
+max_failures: "100%"
+steps:
+  - {name: reboot, command: systemctl reboot, reboot: true}
+  - {name: net, command: systemctl restart networking, disconnect: true, reconnect_timeout: 2m}
+  - {name: plain, command: "true"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acts, err := j.Build(nil, Settings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := acts[0]; !a.Reboot || !a.Disconnect || a.ReconnectTimeout != DefaultRebootTimeout {
+		t.Fatalf("reboot: %+v", a)
+	}
+	if a := acts[1]; a.Reboot || !a.Disconnect || a.ReconnectTimeout != 2*time.Minute {
+		t.Fatalf("disconnect: %+v", a)
+	}
+	if a := acts[2]; a.Disconnect || a.ReconnectTimeout != 0 {
+		t.Fatalf("plain: %+v", a)
 	}
 }

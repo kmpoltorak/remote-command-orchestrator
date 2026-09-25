@@ -1,13 +1,14 @@
 package inventory
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestExamplesLoad(t *testing.T) {
-	files, _ := filepath.Glob("../../examples/inventories/*/hosts.yaml")
+	files, _ := filepath.Glob("../../examples/inventories/*/*.yaml")
 	if len(files) < 2 {
 		t.Fatalf("expected examples, got %d", len(files))
 	}
@@ -98,6 +99,38 @@ func TestFiltering(t *testing.T) {
 	}
 	if names(Selector{Groups: []string{"nope"}}) != "ERR" {
 		t.Error("unknown group must fail")
+	}
+}
+
+func TestLoadMultipleFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		os.WriteFile(p, []byte(body), 0o600)
+		return p
+	}
+	common := write("common.yaml", "credentials: {key: {type: private_key, username: deploy, key_file: /k}}\ndefaults: {credential: key, variables: {ntp: common}}\n")
+	prod := write("prod.yaml", "groups: {web: {hosts: [{name: web-01, address: 10.0.0.1}]}}\nhosts: [{name: lb-01, address: 10.0.0.9}]\n")
+	inv, err := Load(common, prod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs, _ := inv.Select(Selector{})
+	if len(hs) != 2 || hs[1].Credential.Name != "key" || hs[1].Variables["ntp"] != "common" {
+		t.Fatalf("%+v", hs)
+	}
+	if _, err := Load(prod); err == nil {
+		t.Fatal("prod.yaml alone lacks credentials and must fail")
+	}
+	for name, body := range map[string]string{
+		"dup-host.yaml":    "hosts: [{name: web-01, address: 10.0.0.2}]",
+		"dup-group.yaml":   "groups: {web: {hosts: [{name: web-99, address: 10.0.0.3}]}}",
+		"dup-cred.yaml":    "credentials: {key: {type: private_key, username: x, key_file: /y}}",
+		"dup-default.yaml": "defaults: {port: 2222}",
+	} {
+		if _, err := Load(common, prod, write(name, body)); err == nil {
+			t.Errorf("%s: conflicting definitions must fail", name)
+		}
 	}
 }
 
