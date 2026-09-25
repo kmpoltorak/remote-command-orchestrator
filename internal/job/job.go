@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -86,6 +87,9 @@ type Step struct {
 	// restart). That is not an error; rco reconnects before the next step.
 	Disconnect       bool          `yaml:"disconnect" json:"disconnect,omitempty"`
 	ReconnectTimeout time.Duration `yaml:"reconnect_timeout" json:"reconnect_timeout,omitempty"`
+	// FireAndForget: start the command and stop there. The connection may
+	// drop, nothing is checked (e.g. gsmctl -Y switching the SIM card).
+	FireAndForget bool `yaml:"fire_and_forget" json:"fire_and_forget,omitempty"`
 
 	scriptBody []byte
 }
@@ -307,6 +311,16 @@ func (j *Job) Validate() error {
 			}
 			if s.Retries != nil && *s.Retries > 0 {
 				add("%s: retries cannot be combined with reboot/disconnect (the command must not run twice)", loc)
+			}
+		}
+		if s.FireAndForget {
+			switch {
+			case s.Command == "":
+				add("%s: fire_and_forget applies to command steps", loc)
+			case i != len(j.Steps)-1:
+				add("%s: fire_and_forget must be the last step (the connection may be gone afterwards)", loc)
+			case s.Reboot || s.Disconnect || s.Retries != nil || s.Sensitive || !reflect.DeepEqual(s.Expect, Expect{}):
+				add("%s: fire_and_forget checks nothing, so it cannot be combined with reboot, disconnect, retries, sensitive or expect", loc)
 			}
 		}
 		if s.ReconnectTimeout < 0 || s.ReconnectTimeout > MaxTimeout || (s.ReconnectTimeout > 0 && !s.Reboot && !s.Disconnect) {

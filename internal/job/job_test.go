@@ -60,6 +60,10 @@ func TestValidationErrors(t *testing.T) {
 		"no max_failures":   "name: a\nsteps: [{name: s, command: x}]",
 		"bad max_failures":  "name: a\nmax_failures: 0\nsteps: [{name: s, command: x}]",
 		"max_failures pct":  "name: a\nmax_failures: 150%\nsteps: [{name: s, command: x}]",
+		"ff not last":       "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, fire_and_forget: true}, {name: t, command: y}]",
+		"ff with expect":    "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, fire_and_forget: true, expect: {contains: ok}}]",
+		"ff with reboot":    "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, fire_and_forget: true, reboot: true}]",
+		"ff script":         "name: a\nmax_failures: 1\nsteps: [{name: s, script: x.sh, fire_and_forget: true}]",
 		"orphan reconnect":  "name: a\nmax_failures: 1\nsteps: [{name: s, command: x, reconnect_timeout: 1m}]",
 	}
 	for name, doc := range cases {

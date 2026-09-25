@@ -393,6 +393,7 @@ type dryStep struct {
 	Command string `json:"command" yaml:"command"`
 	Sudo    bool   `json:"sudo,omitempty" yaml:"sudo,omitempty"`
 	Timeout string `json:"timeout" yaml:"timeout"`
+	Mode    string `json:"mode,omitempty" yaml:"mode,omitempty"` // reboot | disconnect | fire and forget
 }
 
 func printPreview(w io.Writer, format string, r *runner.Runner, maxFailures int) int {
@@ -403,7 +404,7 @@ func printPreview(w io.Writer, format string, r *runner.Runner, maxFailures int)
 			d.Bastion = p.Target.Bastion.Name
 		}
 		for _, a := range p.Actions {
-			d.Steps = append(d.Steps, dryStep{Name: a.Name, Kind: a.Kind, Command: a.Display, Sudo: a.Sudo, Timeout: a.Timeout.String()})
+			d.Steps = append(d.Steps, dryStep{Name: a.Name, Kind: a.Kind, Command: a.Display, Sudo: a.Sudo, Timeout: a.Timeout.String(), Mode: stepMode(a)})
 		}
 		out = append(out, d)
 	}
@@ -424,9 +425,25 @@ func printPreview(w io.Writer, format string, r *runner.Runner, maxFailures int)
 			if s.Sudo {
 				sudo = "[sudo] "
 			}
-			fmt.Fprintf(w, "  %d. %-20s %s%s\n", i+1, s.Name, sudo, s.Command)
+			mode := ""
+			if s.Mode != "" {
+				mode = "   [" + s.Mode + "]"
+			}
+			fmt.Fprintf(w, "  %d. %-20s %s%s%s\n", i+1, s.Name, sudo, s.Command, mode)
 		}
 	}
 	fmt.Fprintf(w, "\npreview: %d hosts, stop after %d failed hosts; nothing was executed. Add --execute to apply.\n", len(out), maxFailures)
 	return ExitOK
+}
+
+func stepMode(a job.Action) string {
+	switch {
+	case a.FireAndForget:
+		return "fire and forget"
+	case a.Reboot:
+		return "reboot: wait for new boot ID, up to " + a.ReconnectTimeout.String()
+	case a.Disconnect:
+		return "disconnect: reconnect, up to " + a.ReconnectTimeout.String()
+	}
+	return ""
 }

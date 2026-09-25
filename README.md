@@ -185,9 +185,10 @@ Each step has exactly one of these:
 | `continue_on_error` | `false` | Record the failure but keep going. The host is still reported as `FAILED`. |
 | `sensitive` | `false` | Mask the command and output in all output (`[SENSITIVE]`). The command is also sent as a temp file, so it never shows up in the remote process list. |
 | `expect` | exit code 0 | See below. |
-| `reboot` | `false` | The command reboots the host. See [Reboots and connection loss](#reboots-and-connection-loss). |
+| `reboot` | `false` | The command reboots the host. See [Reboots, connection loss and fire-and-forget](#reboots-connection-loss-and-fire-and-forget). |
 | `disconnect` | `false` | The command may drop the SSH connection, e.g. a network or sshd restart. |
 | `reconnect_timeout` | 10m (reboot), 5m (disconnect) | How long to wait for the host to be reachable again. |
+| `fire_and_forget` | `false` | Start the command and stop there. Nothing is checked, and the connection may drop. Must be the last step. |
 
 ### Expectations
 
@@ -204,7 +205,7 @@ expect:
 `contains` and `not_contains` search stdout and stderr, including any part
 dropped by the output limit.
 
-### Reboots and connection loss
+### Reboots, connection loss and fire-and-forget
 
 Some commands cut their own SSH connection: `reboot`, a network restart, an
 sshd restart. For a normal step that is a failure. Mark such steps so it is
@@ -245,6 +246,37 @@ steps:
 - The report shows a `note` such as `host rebooted (new boot ID) and was back after 48s`.
 
 `examples/jobs/kernel-update` upgrades packages, reboots and verifies the host.
+
+**Fire and forget.** Some commands should just be started, with no waiting
+and no checking, for example switching the SIM card on a router, which kills
+the uplink the SSH session runs over:
+
+```yaml
+steps:
+  - name: switch-sim
+    command: gsmctl -Y
+    fire_and_forget: true
+```
+
+`rco` starts the command in the background, detached from the SSH session
+(it ignores SIGHUP and has no terminal), so it keeps running when the
+connection drops. The step succeeds as soon as the command has started, and
+the command's exit code and output are never looked at. Because the connection
+may be gone afterwards, a `fire_and_forget` step must be the last step, and it
+cannot be combined with `reboot`, `disconnect`, `retries`, `sensitive` or
+`expect`.
+
+### OpenWrt and other minimal systems
+
+`rco` needs only a POSIX shell and busybox tools on the host. It works with
+dropbear and was tested against OpenWrt 23.05. On OpenWrt:
+
+- Log in as `root` and don't use `sudo`, which isn't installed.
+- Use `command:` steps. `script:` steps run with `bash`, which OpenWrt doesn't ship.
+- `copy:` works: it needs only `mktemp`, `cp`, `chmod` and `mv`.
+
+`examples/jobs/openwrt-sim-switch` switches the SIM on Teltonika RutOS routers,
+with `examples/inventories/prod/routers.yaml`.
 
 ### Variables
 

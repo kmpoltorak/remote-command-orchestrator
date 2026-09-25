@@ -268,9 +268,19 @@ func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 		}
 		var sr StepResult
 		var f *domain.Failure
-		if a.Disconnect {
+		switch {
+		case a.Disconnect:
 			sr, f, client = r.runDisconnecting(ctx, client, p, a, sudoPW, log)
-		} else {
+		case a.FireAndForget:
+			sr, f = r.runStep(ctx, client.Client, p, a, sudoPW, log)
+			if f != nil && f.Category != domain.CatCancelled && (f.Category == domain.CatSessionFailed || sr.ExitCode == nil) {
+				f = nil // the command cut the connection while starting: that is fine
+				sr.Status, sr.Category, sr.Reason = domain.StatusSuccess, "", ""
+			}
+			if f == nil {
+				sr.Note = "started; result not checked (fire and forget)"
+			}
+		default:
 			sr, f = r.runStep(ctx, client.Client, p, a, sudoPW, log)
 		}
 		h.Steps = append(h.Steps, sr)

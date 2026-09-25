@@ -472,6 +472,33 @@ steps:
 	}
 }
 
+func TestFireAndForget(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, `
+name: ff
+steps:
+  - {name: before, command: "echo up"}
+  - {name: switch, command: "sleep 1; echo switched > marker; exit 3", fire_and_forget: true}
+`, nil)
+	start := time.Now()
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	h := rep.Hosts[0]
+	// Success means "started": the exit code 3 and the output are never looked at.
+	if h.Status != domain.StatusSuccess || !strings.Contains(h.Steps[1].Note, "fire and forget") || time.Since(start) > 900*time.Millisecond {
+		t.Fatalf("must return without waiting for the command: %s %+v", time.Since(start), h)
+	}
+	// The command keeps running after rco closed the connection.
+	marker := filepath.Join(srv.Dir, "marker")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(b)) == "switched" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("background command did not complete after the connection closed")
+}
+
 func TestUnexpectedDisconnectIsAFailure(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
 	j := loadJob(t, "name: n\nsteps: [{name: s, command: rco-test-drop}, {name: after, command: 'true'}]", nil)
