@@ -128,6 +128,9 @@ type Dialer struct {
 	ConnectTimeout   time.Duration
 	HandshakeTimeout time.Duration
 	HostKeys         *HostKeys
+	// Bastions, when set, shares one connection per bastion across hosts.
+	// Without it every host opens its own bastion connection.
+	Bastions *BastionPool
 }
 
 // Hop is one SSH endpoint with its authentication.
@@ -140,10 +143,10 @@ type Hop struct {
 // Client is an established connection, possibly tunnelled through a bastion.
 type Client struct {
 	*ssh.Client
-	bastion *ssh.Client
+	bastion *ssh.Client // owned bastion connection; nil when shared via a BastionPool
 }
 
-// Close closes the target connection and the bastion connection.
+// Close closes the target connection and an owned bastion connection.
 func (c *Client) Close() error {
 	err := c.Client.Close()
 	if c.bastion != nil {
@@ -152,18 +155,19 @@ func (c *Client) Close() error {
 	return err
 }
 
-// Dial connects to target, optionally through bastion. onConnected is called
-// after TCP connect, before authentication (to report AUTHENTICATING).
-func (d *Dialer) Dial(ctx context.Context, target Hop, bastion *Hop, onConnected func()) (*Client, error) {
-	var bc *ssh.Client
+// Dial connects to target, optionally through bastion.
+func (d *Dialer) Dial(ctx context.Context, target Hop, bastion *Hop) (*Client, error) {
+	var bc, owned *ssh.Client
 	var conn net.Conn
 	var err error
 	if bastion != nil {
-		raw, err := d.dialTCP(ctx, bastion.Addr)
-		if err != nil {
-			return nil, prefix(err, "bastion")
+		key := bastion.User + "@" + bastion.Addr
+		if d.Bastions != nil {
+			bc, err = d.Bastions.get(ctx, key, func(ctx context.Context) (*ssh.Client, error) { return d.dialHop(ctx, *bastion) })
+		} else {
+			bc, err = d.dialHop(ctx, *bastion)
+			owned = bc
 		}
-		bc, err = d.handshake(ctx, raw, *bastion)
 		if err != nil {
 			return nil, prefix(err, "bastion")
 		}
@@ -171,23 +175,33 @@ func (d *Dialer) Dial(ctx context.Context, target Hop, bastion *Hop, onConnected
 		conn, err = bc.DialContext(dctx, "tcp", target.Addr)
 		cancel()
 		if err != nil {
-			_ = bc.Close()
+			if owned != nil {
+				_ = owned.Close()
+			} else {
+				d.Bastions.broken(key, bc, err)
+			}
 			return nil, ClassifyDial(err, target.Addr)
 		}
 	} else if conn, err = d.dialTCP(ctx, target.Addr); err != nil {
 		return nil, err
 	}
-	if onConnected != nil {
-		onConnected()
-	}
 	c, err := d.handshake(ctx, conn, target)
 	if err != nil {
-		if bc != nil {
-			_ = bc.Close()
+		if owned != nil {
+			_ = owned.Close()
 		}
 		return nil, err
 	}
-	return &Client{Client: c, bastion: bc}, nil
+	return &Client{Client: c, bastion: owned}, nil
+}
+
+// dialHop opens a full SSH connection to one endpoint.
+func (d *Dialer) dialHop(ctx context.Context, hop Hop) (*ssh.Client, error) {
+	raw, err := d.dialTCP(ctx, hop.Addr)
+	if err != nil {
+		return nil, err
+	}
+	return d.handshake(ctx, raw, hop)
 }
 
 func prefix(err error, what string) error {

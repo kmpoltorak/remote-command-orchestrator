@@ -27,6 +27,20 @@ web-03   FAILED   verify       output does not contain "ntp1.example"   2.52s
 
 ## Install
 
+Download a binary from
+[Releases](https://github.com/kmpoltorak/remote-command-orchestrator/releases)
+for Linux (amd64, arm64, armv7) or macOS (Intel, Apple Silicon). The binary is
+static and has no dependencies:
+
+```bash
+# the repository is private, so use the GitHub CLI (or the web page)
+gh release download --repo kmpoltorak/remote-command-orchestrator --pattern '*darwin_arm64.tar.gz'
+tar -xzf rco_*_darwin_arm64.tar.gz && sudo mv rco_*/rco /usr/local/bin/
+rco version
+```
+
+Or build it yourself:
+
 ```bash
 # the repository is private: let Go fetch it with your git credentials
 GOPRIVATE=github.com/kmpoltorak/* go install github.com/kmpoltorak/remote-command-orchestrator/cmd/rco@latest
@@ -582,10 +596,12 @@ rco run -i prod/hosts.yaml -j jobs/x --execute --only-failed run.jsonl --report 
 - **Memory**: results are kept until the end of the run. With short command
   output that is a few KB per host. For chatty commands, lower `--max-output`
   (for example `16384`).
-- **Bastions**: every host behind a bastion is a separate SSH connection
-  through it. OpenSSH's default `MaxStartups 10:30:100` starts refusing
-  connections above about 10 concurrent logins. Use `-c 10` or raise `MaxStartups`
-  on the bastion.
+- **Bastions**: `rco` logs in to each bastion **once** per run and tunnels every
+  host through that one connection. Hosts that ask for the bastion at the same
+  time wait for the same login. The bastion therefore never sees a storm of
+  logins, and OpenSSH's `MaxStartups` limit doesn't apply. A lost bastion
+  connection is re-established on the next host. Tested with 100 hosts and 50
+  parallel tunnels through one OpenSSH bastion.
 - **Inventory size**: up to 64 MiB per file, and files can be split and
   combined with repeated `-i`.
 
@@ -645,13 +661,21 @@ and `rco version` prints it:
 
 | `rco version` | Meaning |
 |---|---|
-| `rco v0.1.0` | built exactly from tag `v0.1.0` |
-| `rco v0.1.0-3-g9c1d2e3` | 3 commits after `v0.1.0`, at commit `9c1d2e3` |
+| `rco v1.0.0` | built exactly from tag `v1.0.0` |
+| `rco v1.0.0-3-g9c1d2e3` | 3 commits after `v1.0.0`, at commit `9c1d2e3` |
 | `rco 9c1d2e3` | no tags yet, commit `9c1d2e3` |
 | `…-dirty` | built with uncommitted changes, so it matches no commit exactly |
 
-To release, tag `main` (`git tag v0.1.0 && git push origin v0.1.0`) and build
-from the tag.
+To release, tag `main` and push the tag:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+The `release` workflow runs the quality gates, builds
+`rco_<version>_<os>_<arch>.tar.gz` for every platform with `make release`
+(binary, README and LICENSE) plus `checksums.txt`, and publishes them as a
+GitHub Release with generated notes. `make release` does the same locally into `dist/`.
 
 ## License
 

@@ -375,9 +375,20 @@ func TestBastionRun(t *testing.T) {
 	b.Credential = domain.Credential{Name: "b", Type: "password", PasswordEnv: "SUDO_PW"}
 	tg.Bastion = &b.Endpoint
 	j := loadJob(t, "name: b\nsteps: [{name: s, command: 'echo inside'}]", nil)
-	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{tg}}, opts(sshtest.WriteKnownHosts(t, inner, bastion)))
-	if s := rep.Hosts[0].Steps[0]; s.Stdout != "inside" {
-		t.Fatalf("%+v", rep.Hosts[0])
+	var targets []domain.Target
+	for i := range 10 {
+		h := tg
+		h.Name = fmt.Sprintf("internal-%d", i)
+		targets = append(targets, h)
+	}
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: targets}, opts(sshtest.WriteKnownHosts(t, inner, bastion)))
+	for _, h := range rep.Hosts {
+		if h.Status != domain.StatusSuccess || h.Steps[0].Stdout != "inside" {
+			t.Fatalf("%+v", h)
+		}
+	}
+	if n := bastion.Conns.Load(); n != 1 {
+		t.Fatalf("10 hosts behind one bastion must share one connection, got %d", n)
 	}
 }
 
