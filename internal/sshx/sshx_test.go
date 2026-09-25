@@ -32,7 +32,7 @@ func hop(s *sshtest.Server, pw string) Hop {
 
 func connect(t *testing.T, s *sshtest.Server) *Client {
 	t.Helper()
-	c, err := dialer(sshtest.WriteKnownHosts(t, s)).Dial(context.Background(), hop(s, "pw"), nil, nil)
+	c, err := dialer(sshtest.WriteKnownHosts(t, s)).Dial(context.Background(), hop(s, "pw"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,17 +51,17 @@ func TestAuth(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw", AuthorizedKey: signer.PublicKey()})
 	d := dialer(sshtest.WriteKnownHosts(t, srv))
 	ctx := context.Background()
-	c, err := d.Dial(ctx, Hop{Addr: srv.Addr, User: "deploy", Methods: []ssh.AuthMethod{ssh.PublicKeys(signer)}}, nil, nil)
+	c, err := d.Dial(ctx, Hop{Addr: srv.Addr, User: "deploy", Methods: []ssh.AuthMethod{ssh.PublicKeys(signer)}}, nil)
 	if err != nil {
 		t.Fatalf("key auth: %v", err)
 	}
 	c.Close()
-	c, err = d.Dial(ctx, hop(srv, "pw"), nil, nil)
+	c, err = d.Dial(ctx, hop(srv, "pw"), nil)
 	if err != nil {
 		t.Fatalf("password auth: %v", err)
 	}
 	c.Close()
-	_, err = d.Dial(ctx, hop(srv, "wrong-password"), nil, nil)
+	_, err = d.Dial(ctx, hop(srv, "wrong-password"), nil)
 	if category(err) != domain.CatAuthFailed || strings.Contains(err.Error(), "wrong-password") {
 		t.Fatalf("want AUTH_FAILED without leak, got %v", err)
 	}
@@ -78,13 +78,13 @@ func TestHostKeyVerification(t *testing.T) {
 
 	cases := map[string]domain.Category{mismatch: domain.CatHostKeyMismatch, empty: domain.CatHostKeyUnknown, "/nonexistent/kh": domain.CatHostKeyUnknown}
 	for path, want := range cases {
-		if _, err := dialer(path).Dial(context.Background(), hop(srv, "pw"), nil, nil); category(err) != want {
+		if _, err := dialer(path).Dial(context.Background(), hop(srv, "pw"), nil); category(err) != want {
 			t.Errorf("%s: want %s, got %v", path, want, err)
 		}
 	}
 	d := dialer(empty)
 	d.HostKeys.Insecure = true
-	c, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil)
+	c, err := d.Dial(context.Background(), hop(srv, "pw"), nil)
 	if err != nil {
 		t.Fatalf("insecure mode: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestHostKeyAlgorithmFromKnownHosts(t *testing.T) {
 	for name, key := range map[string]ssh.PublicKey{"ed25519": srv.HostKey.PublicKey(), "ecdsa": srv.ECDSAKey.PublicKey()} {
 		kh := filepath.Join(t.TempDir(), "kh")
 		os.WriteFile(kh, []byte(srv.KnownHostsLineFor(key)), 0o600)
-		c, err := dialer(kh).Dial(context.Background(), hop(srv, "pw"), nil, nil)
+		c, err := dialer(kh).Dial(context.Background(), hop(srv, "pw"), nil)
 		if err != nil {
 			t.Errorf("known_hosts with only %s key: %v", name, err)
 			continue
@@ -117,7 +117,7 @@ func TestAcceptNewHostKeys(t *testing.T) {
 	errs := make(chan error, 10)
 	for range 10 {
 		go func() {
-			c, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil)
+			c, err := d.Dial(context.Background(), hop(srv, "pw"), nil)
 			if err == nil {
 				c.Close()
 			}
@@ -134,7 +134,7 @@ func TestAcceptNewHostKeys(t *testing.T) {
 		t.Fatalf("want exactly one known_hosts line, got %d:\n%s", n, data)
 	}
 	// The recorded key is trusted by a strict client afterwards.
-	c, err := dialer(kh).Dial(context.Background(), hop(srv, "pw"), nil, nil)
+	c, err := dialer(kh).Dial(context.Background(), hop(srv, "pw"), nil)
 	if err != nil {
 		t.Fatalf("strict dial after accept-new: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestAcceptNewHostKeys(t *testing.T) {
 	other := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	_, port, _ := net.SplitHostPort(srv.Addr)
 	os.WriteFile(kh, []byte("[127.0.0.1]:"+port+" "+string(ssh.MarshalAuthorizedKey(other.HostKey.PublicKey()))), 0o600)
-	if _, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil); category(err) != domain.CatHostKeyMismatch {
+	if _, err := d.Dial(context.Background(), hop(srv, "pw"), nil); category(err) != domain.CatHostKeyMismatch {
 		t.Fatalf("changed key must fail with accept-new: %v", err)
 	}
 }
@@ -153,7 +153,7 @@ func TestConnectionFailures(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	closed := ln.Addr().String()
 	ln.Close()
-	if _, err := d.Dial(context.Background(), Hop{Addr: closed}, nil, nil); category(err) != domain.CatConnectionRefused {
+	if _, err := d.Dial(context.Background(), Hop{Addr: closed}, nil); category(err) != domain.CatConnectionRefused {
 		t.Fatalf("want CONNECTION_REFUSED, got %v", err)
 	}
 
@@ -170,16 +170,16 @@ func TestConnectionFailures(t *testing.T) {
 	}()
 	d.HandshakeTimeout = 300 * time.Millisecond
 	start := time.Now()
-	if _, err := d.Dial(context.Background(), Hop{Addr: silent.Addr().String()}, nil, nil); category(err) != domain.CatHandshakeFailed || time.Since(start) > 2*time.Second {
+	if _, err := d.Dial(context.Background(), Hop{Addr: silent.Addr().String()}, nil); category(err) != domain.CatHandshakeFailed || time.Since(start) > 2*time.Second {
 		t.Fatalf("want fast SSH_HANDSHAKE_FAILED, got %v after %s", err, time.Since(start))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := d.Dial(ctx, Hop{Addr: "10.255.255.1:22"}, nil, nil); category(err) != domain.CatConnectionTimeout {
+	if _, err := d.Dial(ctx, Hop{Addr: "10.255.255.1:22"}, nil); category(err) != domain.CatConnectionTimeout {
 		t.Fatalf("want CONNECTION_TIMEOUT, got %v", err)
 	}
-	if _, err := d.Dial(context.Background(), Hop{Addr: "no-such-host.invalid:22"}, nil, nil); category(err) != domain.CatDNSFailure {
+	if _, err := d.Dial(context.Background(), Hop{Addr: "no-such-host.invalid:22"}, nil); category(err) != domain.CatDNSFailure {
 		t.Fatalf("want DNS_FAILURE, got %v", err)
 	}
 }
@@ -261,7 +261,7 @@ func TestBastion(t *testing.T) {
 	bastion := sshtest.Start(t, sshtest.Options{Password: "bpw", AllowForward: true})
 	d := dialer(sshtest.WriteKnownHosts(t, target, bastion))
 	b := hop(bastion, "bpw")
-	c, err := d.Dial(context.Background(), hop(target, "pw"), &b, nil)
+	c, err := d.Dial(context.Background(), hop(target, "pw"), &b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,8 +274,90 @@ func TestBastion(t *testing.T) {
 		t.Fatal("bastion must only tunnel")
 	}
 	bad := hop(bastion, "nope")
-	if _, err = d.Dial(context.Background(), hop(target, "pw"), &bad, nil); category(err) != domain.CatAuthFailed || !strings.HasPrefix(domain.AsFailure(err).Reason, "bastion") {
+	if _, err = d.Dial(context.Background(), hop(target, "pw"), &bad); category(err) != domain.CatAuthFailed || !strings.HasPrefix(domain.AsFailure(err).Reason, "bastion") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSharedBastion(t *testing.T) {
+	bastion := sshtest.Start(t, sshtest.Options{Password: "bpw", AllowForward: true})
+	targets := []*sshtest.Server{}
+	for range 4 {
+		targets = append(targets, sshtest.Start(t, sshtest.Options{Password: "pw"}))
+	}
+	d := dialer(sshtest.WriteKnownHosts(t, append(targets, bastion)...))
+	d.Bastions = &BastionPool{}
+	defer d.Bastions.Close()
+	b := hop(bastion, "bpw")
+
+	// 20 hosts at once: a single login on the bastion.
+	errs := make(chan error, 20)
+	for i := range 20 {
+		go func() {
+			c, err := d.Dial(context.Background(), hop(targets[i%4], "pw"), &b)
+			if err == nil {
+				_, err = Exec(context.Background(), c.Client, Request{Command: "true", Timeout: 5 * time.Second, MaxOutput: 1024})
+				c.Close() // must not close the shared bastion connection
+			}
+			errs <- err
+		}()
+	}
+	for range 20 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := bastion.Conns.Load(); n != 1 {
+		t.Fatalf("want 1 bastion connection, got %d", n)
+	}
+
+	// A target the bastion cannot reach does not break the shared connection.
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	closed := ln.Addr().String()
+	ln.Close()
+	if _, err := d.Dial(context.Background(), Hop{Addr: closed, User: "x"}, &b); category(err) != domain.CatConnectionRefused {
+		t.Fatalf("want CONNECTION_REFUSED, got %v", err)
+	}
+	if c, err := d.Dial(context.Background(), hop(targets[0], "pw"), &b); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
+	}
+	if n := bastion.Conns.Load(); n != 1 {
+		t.Fatalf("refused tunnel must keep the bastion connection, got %d connections", n)
+	}
+
+	// A dead bastion connection is replaced on the next dial.
+	d.Bastions.mu.Lock()
+	for _, e := range d.Bastions.conns {
+		e.c.Close()
+	}
+	d.Bastions.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	if c, err := d.Dial(context.Background(), hop(targets[1], "pw"), &b); err != nil {
+		t.Fatalf("redial after bastion loss: %v", err)
+	} else {
+		c.Close()
+	}
+	if n := bastion.Conns.Load(); n != 2 {
+		t.Fatalf("want a second bastion connection, got %d", n)
+	}
+}
+
+func TestSharedBastionAuthFailureIsShared(t *testing.T) {
+	bastion := sshtest.Start(t, sshtest.Options{Password: "bpw", AllowForward: true})
+	target := sshtest.Start(t, sshtest.Options{Password: "pw"})
+	d := dialer(sshtest.WriteKnownHosts(t, target, bastion))
+	d.Bastions = &BastionPool{}
+	bad := hop(bastion, "wrong")
+	errs := make(chan error, 10)
+	for range 10 {
+		go func() { _, err := d.Dial(context.Background(), hop(target, "pw"), &bad); errs <- err }()
+	}
+	for range 10 {
+		if err := <-errs; category(err) != domain.CatAuthFailed {
+			t.Fatalf("want AUTH_FAILED, got %v", err)
+		}
 	}
 }
 
@@ -283,7 +365,7 @@ func TestNoGoroutineLeaks(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw"})
 	d := dialer(sshtest.WriteKnownHosts(t, srv))
 	cycle := func() {
-		c, err := d.Dial(context.Background(), hop(srv, "pw"), nil, nil)
+		c, err := d.Dial(context.Background(), hop(srv, "pw"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}

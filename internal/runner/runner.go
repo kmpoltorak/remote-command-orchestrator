@@ -88,6 +88,7 @@ func Prepare(in Input, o Options) (*Runner, error) {
 		ConnectTimeout:   o.ConnectTimeout,
 		HandshakeTimeout: o.HandshakeTimeout,
 		HostKeys:         &sshx.HostKeys{Path: credentials.ExpandHome(o.KnownHosts), Insecure: o.Insecure, AcceptNew: o.AcceptNewHosts, Logger: o.Logger},
+		Bastions:         &sshx.BastionPool{}, // one connection per bastion for the whole run
 	}
 	auths := map[string]*credentials.Auth{} // one secret lookup per credential
 	resolve := func(c domain.Credential) (*credentials.Auth, error) {
@@ -157,6 +158,7 @@ func (r *Runner) Run(ctx context.Context) *Report {
 	}
 	stopProgress := r.logProgress(len(r.Plans), &done, &running, &failed)
 	defer stopProgress()
+	defer r.dialer.Bastions.Close()
 
 	conc := max(1, r.opts.Concurrency)
 	sem := make(chan struct{}, conc)
@@ -415,7 +417,7 @@ func (r *Runner) dial(ctx context.Context, p Plan) (*sshx.Client, error) {
 	if b := p.Target.Bastion; b != nil {
 		bastion = &sshx.Hop{Addr: b.Addr(), User: b.Username, Methods: p.bastion.Methods}
 	}
-	return r.dialer.Dial(ctx, target, bastion, nil)
+	return r.dialer.Dial(ctx, target, bastion)
 }
 
 // connect dials with retries for transient failures only.
