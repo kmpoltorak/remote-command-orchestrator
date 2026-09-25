@@ -661,15 +661,15 @@ and `rco version` prints it:
 
 | `rco version` | Meaning |
 |---|---|
-| `rco v0.1.0` | built exactly from tag `v0.1.0` |
-| `rco v0.1.0-3-g9c1d2e3` | 3 commits after `v0.1.0`, at commit `9c1d2e3` |
+| `rco v1.0.0` | built exactly from tag `v1.0.0` |
+| `rco v1.0.0-3-g9c1d2e3` | 3 commits after `v1.0.0`, at commit `9c1d2e3` |
 | `rco 9c1d2e3` | no tags yet, commit `9c1d2e3` |
 | `…-dirty` | built with uncommitted changes, so it matches no commit exactly |
 
 To release, tag `main` and push the tag:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v1.0.0 && git push origin v1.0.0
 ```
 
 The `release` workflow runs the quality gates, builds

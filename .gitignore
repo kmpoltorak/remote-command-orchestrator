@@ -11,6 +11,5 @@ id_*
 .idea/
 .vscode/
 
-# Local-only planning and production files
-/IMPLEMENTATION_PLAN.md
+# Personal test inventories and jobs
 /local/

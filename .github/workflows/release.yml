@@ -1,6 +1,6 @@
 name: release
 
-# Push a tag like v0.1.0 to publish a GitHub Release with binaries.
+# Push a tag like v1.0.0 to publish a GitHub Release with binaries.
 on:
   push:
     tags: ["v*"]
