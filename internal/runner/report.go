@@ -67,6 +67,17 @@ func (d Duration) String() string { return time.Duration(d).Round(time.Milliseco
 // MarshalJSON implements json.Marshaler.
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
 
+// UnmarshalJSON implements json.Unmarshaler so saved reports can be read back.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	*d = Duration(v)
+	return err
+}
+
 // MarshalYAML implements yaml.Marshaler.
 func (d Duration) MarshalYAML() (any, error) { return d.String(), nil }
 

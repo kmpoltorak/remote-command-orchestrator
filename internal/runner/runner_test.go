@@ -163,6 +163,16 @@ steps:
 	}
 }
 
+func TestNoPasswdSudoNeverReceivesPassword(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"}) // NOPASSWD sudo
+	j := loadJob(t, "name: n\nsteps: [{name: s, sudo: true, script: s.sh}]",
+		map[string]string{"s.sh": "read -r line && echo \"LEAK:$line\" || echo stdin-empty\n"})
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	if s := rep.Hosts[0].Steps[0]; s.Status != domain.StatusSuccess || s.Stdout != "stdin-empty" {
+		t.Fatalf("password must not reach the command under NOPASSWD sudo: %+v", s)
+	}
+}
+
 func TestStepRetry(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
 	// Fails on the first two tries, succeeds on the third.
@@ -174,8 +184,11 @@ steps:
     retries: 2
 `, nil)
 	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
-	if s := rep.Hosts[0].Steps[0]; s.Status != domain.StatusSuccess || s.Attempts != 3 {
-		t.Fatalf("%+v", s)
+	if s := rep.Hosts[0].Steps[0]; s.Status != domain.StatusSuccess || s.Attempts != 3 || s.Duration < Duration(20*time.Millisecond) {
+		t.Fatalf("%+v", s) // two retry delays of >=5ms each plus command time
+	}
+	if rep.Hosts[0].Duration <= 0 || rep.Duration <= 0 {
+		t.Fatal("durations must be recorded")
 	}
 }
 

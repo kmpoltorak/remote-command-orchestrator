@@ -160,10 +160,10 @@ func notStarted(p Plan) HostResult {
 	return h
 }
 
-func (r *Runner) runHost(ctx context.Context, p Plan) HostResult {
+func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 	start := time.Now()
 	log := r.opts.Logger.With("host", p.Target.Name)
-	h := HostResult{Host: p.Target.Name, Address: p.Target.Addr(), Status: domain.StatusSuccess}
+	h = HostResult{Host: p.Target.Name, Address: p.Target.Addr(), Status: domain.StatusSuccess}
 	fail := func(f *domain.Failure, step string) {
 		if h.Category == "" { // first failure decides the host result
 			h.Category, h.Reason, h.FailedStep = f.Category, r.redact.String(f.Reason), step
@@ -190,13 +190,14 @@ func (r *Runner) runHost(ctx context.Context, p Plan) HostResult {
 	stop := context.AfterFunc(ctx, func() { client.Close() }) // unblock everything on Ctrl+C
 	defer stop()
 
+	sudoPW := r.needsSudoPassword(ctx, client, p)
 	stopped := false
 	for _, a := range p.Actions {
 		if stopped {
 			h.Steps = append(h.Steps, StepResult{Name: a.Name, Kind: a.Kind, Command: a.Display, Status: domain.StatusSkipped})
 			continue
 		}
-		sr, f := r.runStep(ctx, client.Client, p, a, log)
+		sr, f := r.runStep(ctx, client.Client, p, a, sudoPW, log)
 		h.Steps = append(h.Steps, sr)
 		if f != nil {
 			fail(f, a.Name)
@@ -232,11 +233,26 @@ func (r *Runner) connect(ctx context.Context, p Plan, h *HostResult, log *slog.L
 	}
 }
 
-func (r *Runner) runStep(ctx context.Context, c *ssh.Client, p Plan, a job.Action, log *slog.Logger) (StepResult, *domain.Failure) {
-	sr := StepResult{Name: a.Name, Kind: a.Kind, Command: a.Display}
+// needsSudoPassword probes once per host whether sudo works without a
+// password (NOPASSWD). Only if it does not is the password sent. Otherwise a
+// password written to stdin would be passed on to the command itself.
+func (r *Runner) needsSudoPassword(ctx context.Context, c *sshx.Client, p Plan) bool {
+	if p.auth.SudoPassword == "" {
+		return false
+	}
+	for _, a := range p.Actions {
+		if a.Sudo {
+			res, err := sshx.Exec(ctx, c.Client, sshx.Request{Command: "sudo -n true", Timeout: 30 * time.Second, MaxOutput: 4096})
+			return err != nil || res.ExitCode == nil || *res.ExitCode != 0
+		}
+	}
+	return false
+}
+
+func (r *Runner) runStep(ctx context.Context, c *ssh.Client, p Plan, a job.Action, sudoPW bool, log *slog.Logger) (sr StepResult, f *domain.Failure) {
+	sr = StepResult{Name: a.Name, Kind: a.Kind, Command: a.Display}
 	start := time.Now()
 	defer func() { sr.Duration = Duration(time.Since(start)) }()
-	var f *domain.Failure
 	for try := 0; try <= a.Retries; try++ {
 		if try > 0 {
 			log.Warn("step failed, retrying", "step", a.Name, "attempt", try+1, "category", f.Category)
@@ -246,7 +262,7 @@ func (r *Runner) runStep(ctx context.Context, c *ssh.Client, p Plan, a job.Actio
 		}
 		sr.Attempts = try + 1
 		var res sshx.Result
-		res, f = r.attempt(ctx, c, p, a)
+		res, f = r.attempt(ctx, c, p, a, sudoPW)
 		sr.ExitCode = res.ExitCode
 		sr.Stdout, sr.Stderr, sr.Truncated = r.mask(a, res.Stdout), r.mask(a, res.Stderr), res.Truncated
 		// Only outcome failures are worth repeating; a dead session or Ctrl+C is not.
@@ -273,7 +289,7 @@ func (r *Runner) mask(a job.Action, s string) string {
 }
 
 // attempt uploads content if needed, runs the command and checks expectations.
-func (r *Runner) attempt(ctx context.Context, c *ssh.Client, p Plan, a job.Action) (sshx.Result, *domain.Failure) {
+func (r *Runner) attempt(ctx context.Context, c *ssh.Client, p Plan, a job.Action, sudoPW bool) (sshx.Result, *domain.Failure) {
 	tmp := ""
 	if a.Content != nil {
 		res, err := sshx.Exec(ctx, c, sshx.Request{Command: job.UploadCommand, Stdin: a.Content, Timeout: a.Timeout, MaxOutput: 4096})
@@ -285,7 +301,7 @@ func (r *Runner) attempt(ctx context.Context, c *ssh.Client, p Plan, a job.Actio
 		}
 		tmp = res.Stdout
 	}
-	sudoPW := a.Sudo && p.auth.SudoPassword != ""
+	sudoPW = a.Sudo && sudoPW
 	var stdin []byte
 	if sudoPW {
 		stdin = []byte(p.auth.SudoPassword + "\n")
