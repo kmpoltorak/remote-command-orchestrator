@@ -36,6 +36,7 @@ type Options struct {
 	Insecure         bool
 	Env              credentials.Env
 	Logger           *slog.Logger
+	SkipCredentials  bool // dry-run: preview without reading keys or passwords
 }
 
 // Input is what to run where.
@@ -80,6 +81,9 @@ func Prepare(in Input, o Options) (*Runner, error) {
 	}
 	auths := map[string]*credentials.Auth{} // one secret lookup per credential
 	resolve := func(c domain.Credential) (*credentials.Auth, error) {
+		if o.SkipCredentials {
+			return nil, nil
+		}
 		if a, ok := auths[c.Name]; ok {
 			return a, nil
 		}
@@ -187,7 +191,7 @@ func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 		return h
 	}
 	defer client.Close()
-	stop := context.AfterFunc(ctx, func() { client.Close() }) // unblock everything on Ctrl+C
+	stop := context.AfterFunc(ctx, func() { _ = client.Close() }) // unblock everything on Ctrl+C
 	defer stop()
 
 	sudoPW := r.needsSudoPassword(ctx, client, p)
@@ -352,7 +356,7 @@ func backoff(base, maxDelay time.Duration, attempt int) time.Duration {
 	if d > maxDelay || d <= 0 {
 		d = maxDelay
 	}
-	return d/2 + rand.N(d/2+1) // jitter avoids reconnect storms
+	return d/2 + rand.N(d/2+1) //nolint:gosec // jitter to avoid reconnect storms, not security
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

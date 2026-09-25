@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -209,7 +210,11 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 func (s *Server) run(ch ssh.Channel, reqs <-chan *ssh.Request, command string) int {
 	n := s.running.Add(1)
 	defer s.running.Add(-1)
-	for p := s.peak.Load(); n > p && !s.peak.CompareAndSwap(p, n); p = s.peak.Load() {
+	for {
+		p := s.peak.Load()
+		if n <= p || s.peak.CompareAndSwap(p, n) {
+			break
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -231,7 +236,8 @@ func (s *Server) run(ch ssh.Channel, reqs <-chan *ssh.Request, command string) i
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
 	err := cmd.Run()
-	if ee, ok := err.(*exec.ExitError); ok {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
 		if code := ee.ExitCode(); code >= 0 {
 			return code
 		}

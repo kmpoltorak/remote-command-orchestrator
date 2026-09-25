@@ -162,6 +162,7 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	if in.VarEnv, err = pairs(varEnvs, "--var-env"); err != nil {
 		return fail("%v", err)
 	}
+	o.SkipCredentials = *dryRun
 	r, err := runner.Prepare(in, o)
 	if err != nil {
 		return fail("validation failed, no host was contacted:\n%v", err)
@@ -227,7 +228,7 @@ func writeReport(path string, rep *runner.Report) error {
 		return err
 	}
 	if err := encode(f, format, rep); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()

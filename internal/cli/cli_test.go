@@ -17,7 +17,7 @@ import (
 )
 
 type fixture struct {
-	srv                   *sshtest.Server
+	srv                  *sshtest.Server
 	inv, job, known, dir string
 }
 
@@ -31,7 +31,7 @@ func setup(t *testing.T) fixture {
 	os.WriteFile(f.inv, []byte(fmt.Sprintf(`
 credentials:
   pw: {type: password, username: deploy, password_env: RCO_TEST_PW}
-defaults: {credential: pw, address: unused}
+defaults: {credential: pw}
 groups:
   web:
     defaults: {tags: [prod]}
@@ -60,20 +60,15 @@ func main(t *testing.T, args ...string) (int, string, string) {
 
 func TestInventoryWithUnknownFieldFails(t *testing.T) {
 	f := setup(t)
-	code, _, stderr := main(t, "run", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known)
-	if code != ExitError || !strings.Contains(stderr, "address") {
-		t.Fatalf("defaults.address is not a valid field: %d %s", code, stderr)
+	os.WriteFile(f.inv, []byte("defaults: {nosuchfield: typo}\n"), 0o600)
+	code, _, stderr := main(t, "run", "--inventory", f.inv, "--job", f.job)
+	if code != ExitError || !strings.Contains(stderr, "nosuchfield") {
+		t.Fatalf("unknown fields must be rejected: %d %s", code, stderr)
 	}
-}
-
-func fixInventory(f fixture) {
-	data, _ := os.ReadFile(f.inv)
-	os.WriteFile(f.inv, bytes.Replace(data, []byte(", address: unused"), nil, 1), 0o600)
 }
 
 func TestRunJSONAndReport(t *testing.T) {
 	f := setup(t)
-	fixInventory(f)
 	report := filepath.Join(f.dir, "report.yaml")
 	code, stdout, stderr := main(t, "run", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known,
 		"--group", "web", "--output", "json", "--report", report)
@@ -103,7 +98,6 @@ func TestRunJSONAndReport(t *testing.T) {
 
 func TestRunTableAndVars(t *testing.T) {
 	f := setup(t)
-	fixInventory(f)
 	code, stdout, _ := main(t, "run", "--inventory", f.inv, "--job", f.job, "--known-hosts", f.known,
 		"--host", "other", "--var", "color=green", "--verbose")
 	if code != ExitOK || !strings.Contains(stdout, "other") || !strings.Contains(stdout, "| color=green") ||
@@ -114,8 +108,9 @@ func TestRunTableAndVars(t *testing.T) {
 
 func TestDryRunAndValidateDoNotConnect(t *testing.T) {
 	f := setup(t)
-	fixInventory(f)
+	os.Unsetenv("RCO_TEST_PW") // dry-run must not need secrets
 	code, stdout, _ := main(t, "run", "--inventory", f.inv, "--job", f.job, "--dry-run", "--tag", "prod")
+	t.Setenv("RCO_TEST_PW", "cli-secret")
 	if code != ExitOK || !strings.Contains(stdout, "echo color=red") || !strings.Contains(stdout, "dry run: 2 hosts") {
 		t.Fatalf("%d\n%s", code, stdout)
 	}
@@ -134,7 +129,6 @@ func TestDryRunAndValidateDoNotConnect(t *testing.T) {
 
 func TestUsageErrors(t *testing.T) {
 	f := setup(t)
-	fixInventory(f)
 	cases := [][]string{
 		{},
 		{"bogus"},

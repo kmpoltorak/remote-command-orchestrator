@@ -12,6 +12,7 @@ import (
 // Status is the outcome of a host or a step.
 type Status string
 
+// Host and step statuses.
 const (
 	StatusSuccess   Status = "SUCCESS"
 	StatusFailed    Status = "FAILED"
@@ -22,6 +23,7 @@ const (
 // Category is a structured failure classification.
 type Category string
 
+// Failure categories.
 const (
 	CatConnectionTimeout Category = "CONNECTION_TIMEOUT"
 	CatConnectionRefused Category = "CONNECTION_REFUSED"

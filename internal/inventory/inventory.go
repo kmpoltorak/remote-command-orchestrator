@@ -186,7 +186,7 @@ func (inv *Inventory) resolve(group string, gd Defaults, h Host) (domain.Target,
 	for _, m := range []map[string]string{d.Variables, gd.Variables, h.Variables} {
 		for k, v := range m {
 			if err := job.CheckValue(v); err != nil {
-				return t, fmt.Errorf("variable %q: %v", k, err)
+				return t, fmt.Errorf("variable %q: %w", k, err)
 			}
 			if t.Variables == nil {
 				t.Variables = map[string]string{}
@@ -217,7 +217,7 @@ func (inv *Inventory) resolve(group string, gd Defaults, h Host) (domain.Target,
 		}
 		bc, err := inv.credential(b.Credential)
 		if err != nil {
-			return t, fmt.Errorf("bastion %q: %v", name, err)
+			return t, fmt.Errorf("bastion %q: %w", name, err)
 		}
 		t.Bastion = &domain.Endpoint{Name: name, Address: b.Address, Port: first(b.Port, 22), Username: first(b.Username, bc.Username), Credential: bc}
 		if t.Bastion.Address == "" || t.Bastion.Username == "" {

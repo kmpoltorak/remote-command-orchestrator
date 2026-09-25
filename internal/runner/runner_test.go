@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -36,7 +37,7 @@ func target(name string, s *sshtest.Server) domain.Target {
 func opts(known string) Options {
 	return Options{Concurrency: 10, ConnectTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
 		StepTimeout: 10 * time.Second, RetryDelay: 10 * time.Millisecond, MaxRetryDelay: 50 * time.Millisecond,
-		MaxOutput: 1 << 16, KnownHosts: known, Env: lookup}
+		MaxOutput: 1 << 16, KnownHosts: known, Env: lookup, Logger: slog.New(slog.DiscardHandler)}
 }
 
 // loadJob writes a job file (plus extra files) into a temp dir and loads it.
