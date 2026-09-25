@@ -486,6 +486,7 @@ flowchart LR
 ```bash
 make check    # gofmt, go vet, go test -race, go build (same as CI)
 make lint     # golangci-lint
+make vuln     # govulncheck: known vulnerabilities in reachable code
 make build    # bin/rco
 ```
 
