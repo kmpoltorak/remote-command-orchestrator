@@ -73,6 +73,13 @@ type Step struct {
 	RetryDelay      time.Duration `yaml:"retry_delay" json:"retry_delay,omitempty"`
 	ContinueOnError bool          `yaml:"continue_on_error" json:"continue_on_error,omitempty"`
 	Sensitive       bool          `yaml:"sensitive" json:"sensitive,omitempty"`
+	// Reboot: the command reboots the host. Losing the connection is expected;
+	// rco waits until the host is back with a new boot ID.
+	Reboot bool `yaml:"reboot" json:"reboot,omitempty"`
+	// Disconnect: the command may drop the connection (network or sshd
+	// restart). That is not an error; rco reconnects before the next step.
+	Disconnect       bool          `yaml:"disconnect" json:"disconnect,omitempty"`
+	ReconnectTimeout time.Duration `yaml:"reconnect_timeout" json:"reconnect_timeout,omitempty"`
 
 	scriptBody []byte
 }
@@ -282,6 +289,17 @@ func (j *Job) Validate() error {
 		}
 		if s.Retries != nil && (*s.Retries < 0 || *s.Retries > MaxRetries) {
 			add("%s: retries must be 0-%d", loc, MaxRetries)
+		}
+		if s.Reboot || s.Disconnect {
+			if s.Copy != nil {
+				add("%s: reboot/disconnect apply to command and script steps", loc)
+			}
+			if s.Retries != nil && *s.Retries > 0 {
+				add("%s: retries cannot be combined with reboot/disconnect (the command must not run twice)", loc)
+			}
+		}
+		if s.ReconnectTimeout < 0 || s.ReconnectTimeout > MaxTimeout || (s.ReconnectTimeout > 0 && !s.Reboot && !s.Disconnect) {
+			add("%s: reconnect_timeout needs reboot or disconnect and must be 0-%s", loc, MaxTimeout)
 		}
 		e := s.Expect
 		if e.ExitCode != nil && (*e.ExitCode < 0 || *e.ExitCode > 255) {

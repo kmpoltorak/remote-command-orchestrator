@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -144,6 +145,68 @@ func TestShortAliases(t *testing.T) {
 	}
 	if code, out, _ := main(t, "run", "-i", f.inv, "-j", f.job, "-H", "other", "-v"); code != ExitOK || !strings.Contains(out, "preview: 1 hosts") {
 		t.Fatalf("bool alias -v: %d %s", code, out)
+	}
+}
+
+func TestHelpListsEveryFlag(t *testing.T) {
+	code, out, _ := main(t, "help")
+	if code != ExitOK {
+		t.Fatal(code)
+	}
+	newFlags("x").fs.VisitAll(func(f *flag.Flag) {
+		if f.Usage == "alias" {
+			if !strings.Contains(out, "-"+f.Name+", --") {
+				t.Errorf("alias -%s missing from help", f.Name)
+			}
+			return
+		}
+		if !strings.Contains(out, "--"+f.Name+" ") && !strings.Contains(out, "--"+f.Name+"\t") && !strings.Contains(out, "--"+f.Name+"  ") {
+			t.Errorf("--%s missing from help", f.Name)
+		}
+	})
+	if !strings.Contains(out, "--timeout DURATION") || !strings.Contains(out, "-c, --concurrency N") {
+		t.Errorf("value names:\n%s", out)
+	}
+}
+
+func TestParseMaxFailures(t *testing.T) {
+	cases := map[string]int{"": 0, "3": 3, "10%": 100, "0.1%": 1, "100%": 1000}
+	for in, want := range cases {
+		if got, err := parseMaxFailures(in, 1000); err != nil || got != want {
+			t.Errorf("%q: got %d %v, want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"0", "-1", "abc", "101%", "2.5"} {
+		if _, err := parseMaxFailures(bad, 1000); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}
+
+func TestJSONLReportAndOnlyFailed(t *testing.T) {
+	f := setup(t)
+	rep := filepath.Join(f.dir, "run.jsonl")
+	code, _, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known, "--report", rep, "-q")
+	if code != ExitHostsFailed {
+		t.Fatalf("web-02 fails: %d %s", code, stderr)
+	}
+	data, _ := os.ReadFile(rep)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 4 || !strings.Contains(lines[3], `"summary"`) {
+		t.Fatalf("want 3 host lines + summary:\n%s", data)
+	}
+	// Rerun only what did not succeed (web-02 still fails: inventory variables win).
+	code, stdout, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known,
+		"--only-failed", rep, "-o", "json", "-q")
+	var r runner.Report
+	if code != ExitHostsFailed || json.Unmarshal([]byte(stdout), &r) != nil || r.Summary.Total != 1 || r.Hosts[0].Host != "web-02" {
+		t.Fatalf("%d %s %s", code, stdout, stderr)
+	}
+	// A preview must not leave an empty report behind.
+	os.Remove(rep)
+	main(t, "run", "-i", f.inv, "-j", f.job, "--report", rep)
+	if _, err := os.Stat(rep); err == nil {
+		t.Fatal("preview must not create a .jsonl report")
 	}
 }
 

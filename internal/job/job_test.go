@@ -55,6 +55,9 @@ func TestValidationErrors(t *testing.T) {
 		"bad mode":          "name: a\nsteps: [{name: s, copy: {src: f, dest: /etc/x, mode: '999'}}]",
 		"exit code range":   "name: a\nsteps: [{name: s, command: x, expect: {exit_code: 300}}]",
 		"sensitive default": "name: a\nvariables: {pw: {sensitive: true, default: x}}\nsteps: [{name: s, command: x}]",
+		"reboot copy":       "name: a\nsteps: [{name: s, reboot: true, copy: {src: f, dest: /x}}]",
+		"reboot retries":    "name: a\nsteps: [{name: s, command: reboot, reboot: true, retries: 1}]",
+		"orphan reconnect":  "name: a\nsteps: [{name: s, command: x, reconnect_timeout: 1m}]",
 	}
 	for name, doc := range cases {
 		var ve *ValidationError
@@ -183,5 +186,31 @@ steps:
 func TestQuote(t *testing.T) {
 	if got := Quote(`it's`); got != `'it'\''s'` {
 		t.Fatal(got)
+	}
+}
+
+func TestRebootAndDisconnectDefaults(t *testing.T) {
+	j, err := Parse([]byte(`
+name: r
+steps:
+  - {name: reboot, command: systemctl reboot, reboot: true}
+  - {name: net, command: systemctl restart networking, disconnect: true, reconnect_timeout: 2m}
+  - {name: plain, command: "true"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acts, err := j.Build(nil, Settings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := acts[0]; !a.Reboot || !a.Disconnect || a.ReconnectTimeout != DefaultRebootTimeout {
+		t.Fatalf("reboot: %+v", a)
+	}
+	if a := acts[1]; a.Reboot || !a.Disconnect || a.ReconnectTimeout != 2*time.Minute {
+		t.Fatalf("disconnect: %+v", a)
+	}
+	if a := acts[2]; a.Disconnect || a.ReconnectTimeout != 0 {
+		t.Fatalf("plain: %+v", a)
 	}
 }

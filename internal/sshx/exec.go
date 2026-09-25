@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -99,4 +100,48 @@ func Exec(ctx context.Context, c *ssh.Client, req Request) (Result, error) {
 		return res, domain.Fail(domain.CatSessionFailed, "session failed: %v", err)
 	}
 	return res, nil
+}
+
+// Alive sends an SSH keepalive and reports whether the server answered in time.
+func Alive(c *ssh.Client, timeout time.Duration) bool {
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err == nil // any reply, even "unsupported", proves the peer is there
+	case <-t.C:
+		return false
+	}
+}
+
+// KeepAlive checks the connection every interval and closes it after misses
+// unanswered keepalives. A connection silently cut by a network restart then
+// fails in seconds instead of hanging until the step timeout. Call stop when done.
+func KeepAlive(c *ssh.Client, interval time.Duration, misses int) (stop func()) {
+	quit := make(chan struct{})
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		failed := 0
+		for {
+			select {
+			case <-quit:
+				return
+			case <-t.C:
+				if Alive(c, interval) {
+					failed = 0
+				} else if failed++; failed >= misses {
+					_ = c.Close()
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(quit) }) }
 }

@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -38,25 +40,26 @@ const (
 const usage = `rco — run commands, scripts and file uploads on many Linux hosts over SSH
 
 Usage:
-  rco run      --inventory FILE --job JOB [selectors] [options]   preview only
-  rco run      --inventory FILE --job JOB [selectors] --execute   apply changes
-  rco validate --job JOB [--inventory FILE [selectors]]
+  rco run      -i INVENTORY -j JOB [selectors] [options]              preview only
+  rco run      -i INVENTORY -j JOB [selectors] [options] --execute    apply changes
+  rco validate -j JOB [-i INVENTORY [selectors]]                      check without connecting
+  rco version
+  rco help
 
 JOB is a job directory (containing job.yaml) or a job YAML file.
-  rco version
+Selectors are repeatable: AND across kinds, OR within a kind; none = all hosts.
+Every flag also works with a single dash (-execute).
 
-Selectors (repeatable; AND across kinds, OR within a kind; none = all hosts):
-  -g/--group NAME   -t/--tag NAME   -H/--host NAME
+Exit codes: 0 all hosts succeeded, 1 usage or validation error (nothing contacted),
+2 some hosts failed, were skipped or cancelled.
 
-Short flags: -i inventory, -j job, -c concurrency, -o output, -v verbose, -q quiet.
-
-Run "rco run -h" for all options.
+Options:
 `
 
 // Main runs the CLI and returns the process exit code.
 func Main(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
+		printHelp(stderr)
 		return ExitError
 	}
 	switch args[0] {
@@ -68,10 +71,10 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "rco", Version)
 		return ExitOK
 	case "help", "-h", "--help":
-		fmt.Fprint(stdout, usage)
+		printHelp(stdout)
 		return ExitOK
 	}
-	fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
+	fmt.Fprintf(stderr, "unknown command %q (see rco help)\n", args[0])
 	return ExitError
 }
 
@@ -80,56 +83,114 @@ type multi []string
 func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 
-func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
-	name := "run"
-	if validateOnly {
-		name = "validate"
-	}
-	fs := flag.NewFlagSet("rco "+name, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	var (
-		groups, tags, hosts, vars, varEnvs multi
-		o                                  runner.Options
-	)
-	invPath := fs.String("inventory", "", "inventory YAML file")
-	jobPath := fs.String("job", "", "job directory (with job.yaml) or job YAML file")
-	fs.Var(&groups, "group", "select hosts in group (repeatable)")
-	fs.Var(&tags, "tag", "select hosts with tag (repeatable)")
-	fs.Var(&hosts, "host", "select host by name (repeatable)")
-	fs.Var(&vars, "var", "job variable NAME=VALUE (repeatable)")
-	fs.Var(&varEnvs, "var-env", "job variable NAME=ENV_VAR read from the environment; required for sensitive variables (repeatable)")
+// flags holds every run/validate option. One definition serves parsing and help.
+type flags struct {
+	fs                                           *flag.FlagSet
+	inv, groups, tags, hosts, vars, varEnvs      multi
+	o                                            runner.Options
+	job, output, report, onlyFailed, maxFailures string
+	execute, verbose, quiet                      bool
+}
+
+// Short aliases share the long flag's value. --execute deliberately has none:
+// applying changes should always be typed out in full.
+var aliases = map[string]string{
+	"inventory": "i", "job": "j", "group": "g", "tag": "t", "host": "H",
+	"concurrency": "c", "output": "o", "verbose": "v", "quiet": "q",
+}
+
+func newFlags(name string) *flags {
+	f := &flags{fs: flag.NewFlagSet(name, flag.ContinueOnError)}
+	fs, o := f.fs, &f.o
+	// Backquoted words name the flag's value in help output.
+	fs.Var(&f.inv, "inventory", "inventory `FILE`; repeat to combine files (e.g. common.yaml + prod.yaml)")
+	fs.StringVar(&f.job, "job", "", "`JOB` directory (with job.yaml) or job YAML file")
+	fs.Var(&f.groups, "group", "select hosts in group `NAME` (repeatable)")
+	fs.Var(&f.tags, "tag", "select hosts with tag `NAME` (repeatable)")
+	fs.Var(&f.hosts, "host", "select host `NAME` (repeatable)")
+	fs.BoolVar(&f.execute, "execute", false, "actually run the job; without it rco only previews, connecting to nothing")
+	fs.Var(&f.vars, "var", "job variable `NAME=VALUE` (repeatable)")
+	fs.Var(&f.varEnvs, "var-env", "job variable `NAME=ENV_VAR` read from the environment; required for sensitive variables (repeatable)")
 	fs.IntVar(&o.Concurrency, "concurrency", 100, "maximum hosts processed at the same time")
+	fs.StringVar(&f.maxFailures, "max-failures", "", "stop starting new hosts after `N` failed hosts, or N% of all hosts; the rest are SKIPPED")
+	fs.StringVar(&f.onlyFailed, "only-failed", "", "run only on hosts that did not succeed in a previous `REPORT` (.json, .yaml or .jsonl)")
 	fs.DurationVar(&o.StepTimeout, "timeout", 5*time.Minute, "default per-step timeout (job file values win)")
 	fs.DurationVar(&o.ConnectTimeout, "connect-timeout", 10*time.Second, "TCP connect timeout")
 	fs.DurationVar(&o.HandshakeTimeout, "handshake-timeout", 15*time.Second, "SSH handshake and authentication timeout")
 	fs.IntVar(&o.ConnectRetries, "connect-retries", 2, "extra connection attempts for transient failures (never for auth or host key errors)")
 	fs.DurationVar(&o.RetryDelay, "retry-delay", 2*time.Second, "base delay between retries (exponential with jitter)")
 	fs.DurationVar(&o.MaxRetryDelay, "max-retry-delay", 30*time.Second, "maximum delay between connection retries")
-	fs.IntVar(&o.MaxOutput, "max-output", 1<<20, "bytes of stdout/stderr kept per step (head and tail are kept)")
-	fs.StringVar(&o.KnownHosts, "known-hosts", "~/.ssh/known_hosts", "known_hosts file used to verify host keys")
+	fs.IntVar(&o.MaxOutput, "max-output", 1<<20, "`BYTES` of stdout/stderr kept per step (head and tail are kept)")
+	fs.StringVar(&o.KnownHosts, "known-hosts", "~/.ssh/known_hosts", "known_hosts `FILE` used to verify host keys")
 	fs.BoolVar(&o.AcceptNewHosts, "accept-new-host-keys", false, "add keys of hosts missing from known_hosts (trust on first use); changed keys still fail")
 	fs.BoolVar(&o.Insecure, "insecure-skip-host-key-check", false, "INSECURE: do not verify host keys (lab use only)")
-	output := fs.String("output", "table", "result format on stdout: table, json or yaml")
-	reportPath := fs.String("report", "", "also write the full report to FILE (.json, .yaml or .yml)")
-	execute := fs.Bool("execute", false, "actually run the job; without it rco only previews what would run, without connecting")
-	verbose := fs.Bool("verbose", false, "table output: include every step with its output")
-	quiet := fs.Bool("quiet", false, "log only warnings and errors")
-	// Short aliases share the long flag's value. --execute deliberately has
-	// none: applying changes should always be typed out in full.
-	for short, long := range map[string]string{
-		"i": "inventory", "j": "job", "g": "group", "t": "tag", "H": "host",
-		"c": "concurrency", "o": "output", "v": "verbose", "q": "quiet",
-	} {
-		fs.Var(fs.Lookup(long).Value, short, "short for --"+long)
+	fs.StringVar(&f.output, "output", "table", "result `FORMAT` on stdout: table, json or yaml")
+	fs.StringVar(&f.report, "report", "", "also write the full report to `FILE` (.json, .yaml; .jsonl is written host by host as results arrive)")
+	fs.BoolVar(&f.verbose, "verbose", false, "table output: include every step with its output")
+	fs.BoolVar(&f.quiet, "quiet", false, "log only warnings and errors (hides progress)")
+	for long, short := range aliases {
+		fs.Var(fs.Lookup(long).Value, short, "alias")
 	}
-	if err := fs.Parse(args); err != nil {
+	return f
+}
+
+func printHelp(w io.Writer) {
+	fmt.Fprint(w, usage)
+	printFlags(w, newFlags("rco").fs)
+}
+
+// printFlags lists flags in definition order as "-i, --inventory FILE".
+func printFlags(w io.Writer, fs *flag.FlagSet) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, name := range flagOrder {
+		f := fs.Lookup(name)
+		arg, usage := flag.UnquoteUsage(f)
+		if _, isBool := f.Value.(interface{ IsBoolFlag() bool }); isBool {
+			arg = ""
+		} else {
+			arg = map[string]string{"int": "N", "duration": "DURATION", "value": "VALUE", "string": "VALUE"}[arg] + strings.TrimLeft(arg, "abcdefghijklmnopqrstuvwxyz")
+		}
+		head := "    --" + name
+		if short, ok := aliases[name]; ok {
+			head = "-" + short + ", --" + name
+		}
+		if arg != "" {
+			head += " " + arg
+		}
+		if def := f.DefValue; def != "" && def != "false" && def != "0" {
+			usage += " (default " + def + ")"
+		}
+		fmt.Fprintf(tw, "  %s\t%s\n", head, usage)
+	}
+	_ = tw.Flush()
+}
+
+// flagOrder is the help order (flag.VisitAll would sort alphabetically).
+var flagOrder = []string{
+	"inventory", "job", "group", "tag", "host", "execute", "var", "var-env",
+	"concurrency", "max-failures", "only-failed", "timeout", "connect-timeout", "handshake-timeout",
+	"connect-retries", "retry-delay", "max-retry-delay", "max-output",
+	"known-hosts", "accept-new-host-keys", "insecure-skip-host-key-check",
+	"output", "report", "verbose", "quiet",
+}
+
+func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
+	name := "rco run"
+	if validateOnly {
+		name = "rco validate"
+	}
+	f := newFlags(name)
+	f.fs.SetOutput(stderr)
+	f.fs.Usage = func() { printHelp(stderr) }
+	if err := f.fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return ExitOK
 		}
 		return ExitError
 	}
+	o := f.o
 	level := slog.LevelInfo
-	if *quiet {
+	if f.quiet {
 		level = slog.LevelWarn
 	}
 	o.Logger = slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
@@ -139,73 +200,111 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	}
 
 	switch {
-	case fs.NArg() > 0:
-		return fail("unexpected argument %q", fs.Arg(0))
-	case *jobPath == "":
+	case f.fs.NArg() > 0:
+		return fail("unexpected argument %q", f.fs.Arg(0))
+	case f.job == "":
 		return fail("--job is required")
-	case *invPath == "" && !validateOnly:
+	case len(f.inv) == 0 && !validateOnly:
 		return fail("--inventory is required")
-	case *output != "table" && *output != "json" && *output != "yaml":
+	case f.output != "table" && f.output != "json" && f.output != "yaml":
 		return fail("--output must be table, json or yaml")
 	case o.Concurrency < 1 || o.MaxOutput < 1024:
 		return fail("--concurrency must be >= 1 and --max-output >= 1024")
 	}
-	j, err := job.Load(*jobPath)
+	j, err := job.Load(f.job)
 	if err != nil {
 		return fail("%v", err)
 	}
-	if validateOnly && *invPath == "" {
+	if validateOnly && len(f.inv) == 0 {
 		fmt.Fprintf(stdout, "job %q is valid (%d steps, sha256 %s)\n", j.Name, len(j.Steps), j.Hash[:12])
 		return ExitOK
 	}
-	inv, err := inventory.Load(*invPath)
+	inv, err := inventory.Load(f.inv...)
 	if err != nil {
 		return fail("%v", err)
 	}
-	targets, err := inv.Select(inventory.Selector{Groups: groups, Tags: tags, Hosts: hosts})
+	targets, err := inv.Select(inventory.Selector{Groups: f.groups, Tags: f.tags, Hosts: f.hosts})
 	if err != nil {
 		return fail("%v", err)
+	}
+	if f.onlyFailed != "" {
+		if targets, err = onlyFailed(f.onlyFailed, j.Name, targets, o.Logger); err != nil {
+			return fail("--only-failed: %v", err)
+		}
 	}
 	if len(targets) == 0 {
 		return fail("no hosts match the selectors")
 	}
-	in := runner.Input{Job: j, Targets: targets}
-	if in.Vars, err = pairs(vars, "--var"); err != nil {
+	if o.MaxFailures, err = parseMaxFailures(f.maxFailures, len(targets)); err != nil {
 		return fail("%v", err)
 	}
-	if in.VarEnv, err = pairs(varEnvs, "--var-env"); err != nil {
+	in := runner.Input{Job: j, Targets: targets}
+	if in.Vars, err = pairs(f.vars, "--var"); err != nil {
+		return fail("%v", err)
+	}
+	if in.VarEnv, err = pairs(f.varEnvs, "--var-env"); err != nil {
 		return fail("%v", err)
 	}
 	// A preview must work without access to keys and passwords; validate checks them.
-	o.SkipCredentials = !*execute && !validateOnly
+	o.SkipCredentials = !f.execute && !validateOnly
+	o.Progress = 10 * time.Second
+	stream, err := openStream(f.report, &o)
+	if err != nil {
+		return fail("--report: %v", err)
+	}
 	r, err := runner.Prepare(in, o)
 	if err != nil {
+		stream.discard()
 		return fail("validation failed, no host was contacted:\n%v", err)
 	}
 	if validateOnly {
 		fmt.Fprintf(stdout, "job %q is valid for %d hosts\n", j.Name, len(targets))
 		return ExitOK
 	}
-	if !*execute {
-		return printPreview(stdout, *output, r)
+	if !f.execute {
+		stream.discard()
+		return printPreview(stdout, f.output, r)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	o.Logger.Info("starting", "job", j.Name, "hosts", len(targets), "concurrency", o.Concurrency)
+	o.Logger.Info("starting", "job", j.Name, "hosts", len(targets), "concurrency", o.Concurrency, "max_failures", o.MaxFailures)
 	rep := r.Run(ctx)
-	if *reportPath != "" {
-		if err := writeReport(*reportPath, rep); err != nil {
+	if stream != nil {
+		if err := stream.close(rep); err != nil {
+			fmt.Fprintf(stderr, "error: writing report: %v\n", err)
+		}
+	} else if f.report != "" {
+		if err := writeReport(f.report, rep); err != nil {
 			fmt.Fprintf(stderr, "error: writing report: %v\n", err)
 		}
 	}
-	if err := printReport(stdout, *output, *verbose, rep); err != nil {
+	if err := printReport(stdout, f.output, f.verbose, rep); err != nil {
 		return fail("%v", err)
 	}
 	if !rep.OK() {
 		return ExitHostsFailed
 	}
 	return ExitOK
+}
+
+// parseMaxFailures accepts "", "N" or "N%" (of the selected hosts, at least 1).
+func parseMaxFailures(v string, total int) (int, error) {
+	if v == "" {
+		return 0, nil
+	}
+	pct := strings.HasSuffix(v, "%")
+	n, err := strconv.ParseFloat(strings.TrimSuffix(v, "%"), 64)
+	if err != nil || n <= 0 || (pct && n > 100) {
+		return 0, fmt.Errorf("--max-failures %q: want a positive number or a percentage like 5%%", v)
+	}
+	if pct {
+		return max(1, int(math.Ceil(n*float64(total)/100))), nil
+	}
+	if n != math.Trunc(n) {
+		return 0, fmt.Errorf("--max-failures %q: want a whole number of hosts", v)
+	}
+	return int(n), nil
 }
 
 func pairs(in []string, flagName string) (map[string]string, error) {
@@ -262,6 +361,9 @@ func printReport(w io.Writer, format string, verbose bool, rep *runner.Report) e
 				fmt.Fprintf(tw, "  %d. %s\t%s\t%s\t%s\t%s\n", i+1, s.Name, s.Status, s.Command, dash(s.Reason), s.Duration)
 				for _, line := range outputLines(s.Stdout, s.Stderr) {
 					fmt.Fprintf(tw, "     %s\t\t\t\t\n", line)
+				}
+				if s.Note != "" {
+					fmt.Fprintf(tw, "     ~ %s\t\t\t\t\n", s.Note)
 				}
 			}
 		}

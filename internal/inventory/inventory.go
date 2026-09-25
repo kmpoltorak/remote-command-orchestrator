@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -71,25 +72,81 @@ type Selector struct {
 
 var hostNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$`)
 
-// Load reads and parses an inventory file.
-func Load(path string) (*Inventory, error) {
-	data, err := job.ReadFile(path, job.MaxFileSize)
+// MaxFileSize bounds one inventory file; large fleets need big files
+// (roughly 60 bytes per host in the short form).
+const MaxFileSize = 64 << 20
+
+// Load reads one or more inventory files and combines them. Credentials,
+// bastions, groups and hosts from all files are merged; a name defined in two
+// files is an error, never a silent override. `defaults` may be set in one
+// file only. This allows e.g. a shared common.yaml plus one file per
+// environment.
+func Load(paths ...string) (*Inventory, error) {
+	merged := &Inventory{}
+	defaultsFrom := ""
+	for _, p := range paths {
+		data, err := job.ReadFile(p, MaxFileSize)
+		if err != nil {
+			return nil, err
+		}
+		inv, err := decode(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		if !reflect.DeepEqual(inv.Defaults, Defaults{}) {
+			if defaultsFrom != "" {
+				return nil, fmt.Errorf("defaults are set in both %s and %s; keep them in one file", defaultsFrom, p)
+			}
+			defaultsFrom, merged.Defaults = p, inv.Defaults
+		}
+		if err := mergeInto(&merged.Credentials, inv.Credentials, "credential", p); err != nil {
+			return nil, err
+		}
+		if err := mergeInto(&merged.Bastions, inv.Bastions, "bastion", p); err != nil {
+			return nil, err
+		}
+		if err := mergeInto(&merged.Groups, inv.Groups, "group", p); err != nil {
+			return nil, err
+		}
+		merged.Hosts = append(merged.Hosts, inv.Hosts...)
+	}
+	if _, err := merged.Select(Selector{}); err != nil { // host names are checked for duplicates here
+		return nil, err
+	}
+	return merged, nil
+}
+
+func mergeInto[V any](dst *map[string]V, src map[string]V, kind, file string) error {
+	for k, v := range src {
+		if _, dup := (*dst)[k]; dup {
+			return fmt.Errorf("%s: %s %q is already defined in another inventory file", file, kind, k)
+		}
+		if *dst == nil {
+			*dst = map[string]V{}
+		}
+		(*dst)[k] = v
+	}
+	return nil
+}
+
+// Parse decodes and validates a single, self-contained inventory.
+func Parse(data []byte) (*Inventory, error) {
+	inv, err := decode(data)
 	if err != nil {
 		return nil, err
 	}
-	return Parse(data)
+	if _, err := inv.Select(Selector{}); err != nil {
+		return nil, err
+	}
+	return inv, nil
 }
 
-// Parse decodes and validates an inventory.
-func Parse(data []byte) (*Inventory, error) {
+func decode(data []byte) (*Inventory, error) {
 	var inv Inventory
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&inv); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("inventory YAML: %w", err)
-	}
-	if _, err := inv.Select(Selector{}); err != nil {
-		return nil, err
 	}
 	return &inv, nil
 }

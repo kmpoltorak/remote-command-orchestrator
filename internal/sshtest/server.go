@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -53,7 +54,10 @@ type Server struct {
 	mu       sync.Mutex
 	commands []string
 	running  atomic.Int64
-	peak     atomic.Int64
+	// downUntil (unix nanos) makes the server drop new connections, like a
+	// host that is rebooting.
+	downUntil atomic.Int64
+	peak      atomic.Int64
 }
 
 // Start launches a server on 127.0.0.1:0; it stops at test cleanup.
@@ -100,11 +104,16 @@ func Start(t testing.TB, o Options) *Server {
 	}
 	cfg.AddHostKey(signer)
 	cfg.AddHostKey(ecSigner)
+	s.newBootID()
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
+			}
+			if time.Now().UnixNano() < s.downUntil.Load() {
+				_ = c.Close()
+				continue
 			}
 			go s.serve(c, cfg)
 		}
@@ -163,7 +172,7 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 				continue
 			}
 			s.Sessions.Add(1)
-			go s.session(ch, creqs)
+			go s.session(sc, ch, creqs)
 		case "direct-tcpip":
 			s.forward(nc)
 		default:
@@ -198,7 +207,24 @@ func (s *Server) forward(nc ssh.NewChannel) {
 	go func() { _, _ = io.Copy(ch, target); ch.Close() }()
 }
 
-func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
+// BootID is the current simulated boot ID, stored in Dir/boot_id.
+func (s *Server) BootID() string {
+	b, _ := os.ReadFile(filepath.Join(s.Dir, "boot_id"))
+	return string(b)
+}
+
+func (s *Server) newBootID() {
+	id := make([]byte, 8)
+	_, _ = rand.Read(id)
+	_ = os.WriteFile(filepath.Join(s.Dir, "boot_id"), fmt.Appendf(nil, "%x\n", id), 0o600)
+}
+
+// session serves one channel. Two magic commands simulate what reboots and
+// network restarts do to a real server:
+//
+//	rco-test-drop          the connection dies mid-command (no exit status)
+//	rco-test-reboot DUR    new boot ID, connection dies, no new connections for DUR
+func (s *Server) session(sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	for req := range reqs {
 		if req.Type != "exec" || s.opts.RejectExec {
@@ -211,6 +237,17 @@ func (s *Server) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		s.mu.Lock()
 		s.commands = append(s.commands, p.Command)
 		s.mu.Unlock()
+		if p.Command == "rco-test-drop" {
+			_ = sc.Close()
+			return
+		}
+		if d, ok := strings.CutPrefix(p.Command, "rco-test-reboot "); ok {
+			down, _ := time.ParseDuration(d)
+			s.newBootID()
+			s.downUntil.Store(time.Now().Add(down).UnixNano())
+			_ = sc.Close()
+			return
+		}
 		code := s.run(ch, reqs, p.Command)
 		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(code)}))
 		return

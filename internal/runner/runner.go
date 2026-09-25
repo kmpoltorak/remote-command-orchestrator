@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -38,6 +39,14 @@ type Options struct {
 	Env              credentials.Env
 	Logger           *slog.Logger
 	SkipCredentials  bool // dry-run: preview without reading keys or passwords
+	// MaxFailures stops starting new hosts once this many hosts have failed
+	// (0 = never stop). Hosts already running finish; the rest are SKIPPED.
+	MaxFailures int
+	// Progress logs a progress line at this interval (0 = off).
+	Progress time.Duration
+	// OnHostDone is called as soon as each host has a final result, from
+	// several goroutines at once. Used to stream reports to disk.
+	OnHostDone func(HostResult)
 }
 
 // Input is what to run where.
@@ -135,6 +144,20 @@ func (r *Runner) Run(ctx context.Context) *Report {
 	if r.opts.Insecure {
 		r.opts.Logger.Warn("INSECURE: host key verification is disabled (--insecure-skip-host-key-check)")
 	}
+	var failed, done, running atomic.Int64
+	finish := func(i int, h HostResult) {
+		rep.Hosts[i] = h
+		if h.Status == domain.StatusFailed {
+			failed.Add(1)
+		}
+		done.Add(1)
+		if r.opts.OnHostDone != nil {
+			r.opts.OnHostDone(h)
+		}
+	}
+	stopProgress := r.logProgress(len(r.Plans), &done, &running, &failed)
+	defer stopProgress()
+
 	conc := max(1, r.opts.Concurrency)
 	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
@@ -142,13 +165,21 @@ func (r *Runner) Run(ctx context.Context) *Report {
 		select {
 		case sem <- struct{}{}: // bounded: at most conc host goroutines exist
 		case <-ctx.Done():
-			rep.Hosts[i] = notStarted(p)
+			finish(i, notStarted(p, domain.StatusCancelled, "cancelled before start"))
 			continue
 		}
+		if m := r.opts.MaxFailures; m > 0 && failed.Load() >= int64(m) {
+			<-sem
+			finish(i, notStarted(p, domain.StatusSkipped, fmt.Sprintf("not started: %d hosts failed (--max-failures %d)", failed.Load(), m)))
+			continue
+		}
+		running.Add(1)
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			rep.Hosts[i] = r.runHost(ctx, p)
+			h := r.runHost(ctx, p)
+			running.Add(-1)
+			finish(i, h)
 		}()
 	}
 	wg.Wait()
@@ -156,9 +187,38 @@ func (r *Runner) Run(ctx context.Context) *Report {
 	return rep
 }
 
-func notStarted(p Plan) HostResult {
-	h := HostResult{Host: p.Target.Name, Address: p.Target.Addr(), Status: domain.StatusCancelled,
-		Category: domain.CatCancelled, Reason: "cancelled before start"}
+// logProgress logs done/total, failures and an ETA until the returned stop is called.
+func (r *Runner) logProgress(total int, done, running, failed *atomic.Int64) (stop func()) {
+	if r.opts.Progress <= 0 {
+		return func() {}
+	}
+	start := time.Now()
+	t := time.NewTicker(r.opts.Progress)
+	quit := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-quit:
+				return
+			case <-t.C:
+				d := done.Load()
+				args := []any{"done", d, "total", total, "running", running.Load(), "failed", failed.Load()}
+				if d > 0 {
+					eta := time.Duration(float64(time.Since(start)) / float64(d) * float64(int64(total)-d))
+					args = append(args, "eta", eta.Round(time.Second).String())
+				}
+				r.opts.Logger.Info("progress", args...)
+			}
+		}
+	}()
+	return func() { t.Stop(); close(quit) }
+}
+
+func notStarted(p Plan, status domain.Status, reason string) HostResult {
+	h := HostResult{Host: p.Target.Name, Address: p.Target.Addr(), Status: status, Reason: reason}
+	if status == domain.StatusCancelled {
+		h.Category = domain.CatCancelled
+	}
 	for _, a := range p.Actions {
 		h.Steps = append(h.Steps, StepResult{Name: a.Name, Kind: a.Kind, Command: a.Display, Status: domain.StatusSkipped})
 	}
@@ -191,9 +251,13 @@ func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 		}
 		return h
 	}
-	defer client.Close()
-	stop := context.AfterFunc(ctx, func() { _ = client.Close() }) // unblock everything on Ctrl+C
-	defer stop()
+	// The client can be replaced by a reconnect after a reboot/disconnect step.
+	// Every blocking call (Dial, Exec, sleeps) honours ctx, so Ctrl+C unblocks them.
+	defer func() {
+		if client != nil {
+			_ = client.Close()
+		}
+	}()
 
 	sudoPW := r.needsSudoPassword(ctx, client, p)
 	stopped := false
@@ -202,11 +266,17 @@ func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 			h.Steps = append(h.Steps, StepResult{Name: a.Name, Kind: a.Kind, Command: a.Display, Status: domain.StatusSkipped})
 			continue
 		}
-		sr, f := r.runStep(ctx, client.Client, p, a, sudoPW, log)
+		var sr StepResult
+		var f *domain.Failure
+		if a.Disconnect {
+			sr, f, client = r.runDisconnecting(ctx, client, p, a, sudoPW, log)
+		} else {
+			sr, f = r.runStep(ctx, client.Client, p, a, sudoPW, log)
+		}
 		h.Steps = append(h.Steps, sr)
 		if f != nil {
 			fail(f, a.Name)
-			if !a.ContinueOnError || f.Category == domain.CatCancelled || f.Category == domain.CatSessionFailed {
+			if !a.ContinueOnError || client == nil || f.Category == domain.CatCancelled || f.Category == domain.CatSessionFailed {
 				stopped = true
 			}
 		}
@@ -214,16 +284,135 @@ func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 	return h
 }
 
-// connect dials with retries for transient failures only.
-func (r *Runner) connect(ctx context.Context, p Plan, h *HostResult, log *slog.Logger) (*sshx.Client, error) {
+// Tunables for reboot/disconnect steps (variables so tests can shorten them).
+var (
+	// bootIDCommand prints an ID that changes on every boot (Linux).
+	bootIDCommand     = "cat /proc/sys/kernel/random/boot_id"
+	reconnectDelay    = 5 * time.Second // pause between attempts to reach the host again
+	keepaliveInterval = 5 * time.Second // three missed keepalives = connection lost
+)
+
+// runDisconnecting runs a step that may drop the connection (reboot, network
+// or sshd restart). A lost connection is the expected outcome, not an error.
+// Afterwards rco reconnects; for a reboot it waits for a new boot ID, so it
+// cannot mistake the host that is still shutting down for one that is back.
+// It returns the client to use for the next steps (nil if the host is gone).
+func (r *Runner) runDisconnecting(ctx context.Context, c *sshx.Client, p Plan, a job.Action, sudoPW bool, log *slog.Logger) (StepResult, *domain.Failure, *sshx.Client) {
+	oldBoot := ""
+	if a.Reboot {
+		id, f := r.bootID(ctx, c)
+		if f != nil {
+			f = domain.Fail(f.Category, "cannot read the boot ID before rebooting: %s", f.Reason)
+			return StepResult{Name: a.Name, Kind: a.Kind, Command: a.Display, Status: domain.StatusFailed, Category: f.Category, Reason: r.redact.String(f.Reason)}, f, c
+		}
+		oldBoot = id
+	}
+	// A silently cut connection (no TCP reset) is noticed within seconds.
+	stop := sshx.KeepAlive(c.Client, keepaliveInterval, 3)
+	sr, f := r.runStep(ctx, c.Client, p, a, sudoPW, log)
+	stop()
+	lost := f != nil && (f.Category == domain.CatSessionFailed || (f.Category == domain.CatCommandFailed && sr.ExitCode == nil))
+	if f != nil && !lost {
+		return sr, f, c // a real failure while the connection was fine
+	}
+	if lost {
+		sr.Status, sr.Category, sr.Reason = domain.StatusSuccess, "", ""
+	}
+	if !a.Reboot && !lost && sshx.Alive(c.Client, keepaliveInterval) {
+		return sr, nil, c // the connection survived, e.g. a quick network restart
+	}
+	_ = c.Close()
+	start := time.Now()
+	log.Info("waiting for host to come back", "step", a.Name, "reboot", a.Reboot, "timeout", a.ReconnectTimeout.String())
+	nc, wf := r.waitForHost(ctx, p, a.ReconnectTimeout, oldBoot)
+	if wf != nil {
+		sr.Status, sr.Category, sr.Reason = domain.StatusFailed, wf.Category, r.redact.String(wf.Reason)
+		if wf.Category == domain.CatCancelled {
+			sr.Status = domain.StatusCancelled
+		}
+		return sr, wf, nil
+	}
+	back := time.Since(start).Round(time.Second)
+	sr.Note = fmt.Sprintf("connection closed as expected; host back after %s", back)
+	if a.Reboot {
+		sr.Note = fmt.Sprintf("host rebooted (new boot ID) and was back after %s", back)
+	}
+	log.Info("host is back", "step", a.Name, "after", back.String())
+	return sr, nil, nc
+}
+
+// waitForHost reconnects until the host answers (with a boot ID other than
+// oldBoot, when set) or timeout passes. Auth and host key errors end the wait:
+// they will not fix themselves, and a changed host key must never be retried.
+func (r *Runner) waitForHost(ctx context.Context, p Plan, timeout time.Duration, oldBoot string) (*sshx.Client, *domain.Failure) {
+	deadline := time.Now().Add(timeout)
+	last := domain.Fail(domain.CatConnectionTimeout, "no connection attempt made")
+	sawOldBoot := false
+	for {
+		if sleep(ctx, reconnectDelay) != nil {
+			return nil, domain.Fail(domain.CatCancelled, "cancelled while waiting for the host to come back")
+		}
+		if time.Now().After(deadline) {
+			if sawOldBoot {
+				return nil, domain.Fail(domain.CatCommandFailed, "host is reachable but was not rebooted within %s (boot ID unchanged)", timeout)
+			}
+			return nil, domain.Fail(domain.CatConnectionTimeout, "host did not come back within %s (last: %s)", timeout, last.Reason)
+		}
+		dctx, cancel := context.WithDeadline(ctx, deadline)
+		c, err := r.dial(dctx, p)
+		cancel()
+		if err != nil {
+			last = domain.AsFailure(err)
+			if ctx.Err() != nil {
+				return nil, domain.Fail(domain.CatCancelled, "cancelled while waiting for the host to come back")
+			}
+			switch last.Category {
+			case domain.CatAuthFailed, domain.CatHostKeyMismatch, domain.CatHostKeyUnknown:
+				return nil, last
+			}
+			continue
+		}
+		if oldBoot == "" {
+			return c, nil
+		}
+		id, f := r.bootID(ctx, c)
+		if f == nil && id != oldBoot {
+			return c, nil
+		}
+		_ = c.Close()
+		if last = f; f == nil {
+			sawOldBoot = true
+			last = domain.Fail(domain.CatConnectionTimeout, "host still runs the old boot (not rebooted yet)")
+		}
+	}
+}
+
+func (r *Runner) bootID(ctx context.Context, c *sshx.Client) (string, *domain.Failure) {
+	res, err := sshx.Exec(ctx, c.Client, sshx.Request{Command: bootIDCommand, Timeout: 30 * time.Second, MaxOutput: 4096})
+	if err != nil {
+		return "", domain.AsFailure(err)
+	}
+	id := strings.TrimSpace(res.Stdout)
+	if res.ExitCode == nil || *res.ExitCode != 0 || id == "" {
+		return "", domain.Fail(domain.CatCommandFailed, "%s failed: %s", bootIDCommand, lastLine(res.Stderr))
+	}
+	return id, nil
+}
+
+func (r *Runner) dial(ctx context.Context, p Plan) (*sshx.Client, error) {
 	target := sshx.Hop{Addr: p.Target.Addr(), User: p.Target.Username, Methods: p.auth.Methods}
 	var bastion *sshx.Hop
 	if b := p.Target.Bastion; b != nil {
 		bastion = &sshx.Hop{Addr: b.Addr(), User: b.Username, Methods: p.bastion.Methods}
 	}
+	return r.dialer.Dial(ctx, target, bastion, nil)
+}
+
+// connect dials with retries for transient failures only.
+func (r *Runner) connect(ctx context.Context, p Plan, h *HostResult, log *slog.Logger) (*sshx.Client, error) {
 	for attempt := 1; ; attempt++ {
 		h.ConnectAttempts = attempt
-		c, err := r.dialer.Dial(ctx, target, bastion, nil)
+		c, err := r.dial(ctx, p)
 		if err == nil {
 			return c, nil
 		}
