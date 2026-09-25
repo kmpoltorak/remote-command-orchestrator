@@ -43,10 +43,11 @@ func (b *Buffer) Write(p []byte) (int, error) {
 	switch {
 	case !b.truncated && len(b.head)+len(p) <= b.limit:
 		b.head = append(b.head, p...)
-	case !b.truncated:
+	case !b.truncated: // first overflow: len(all) > limit, so the head half is always full
 		b.truncated = true
-		b.tail = append(append([]byte{}, b.head[min(half, len(b.head)):]...), p...)
-		b.head = b.head[:min(half, len(b.head))]
+		all := append(b.head, p...)
+		b.head = append([]byte{}, all[:half]...)
+		b.tail = append([]byte{}, all[half:]...)
 	default:
 		b.tail = append(b.tail, p...)
 	}

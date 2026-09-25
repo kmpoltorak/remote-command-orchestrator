@@ -21,6 +21,11 @@ func TestBuffer(t *testing.T) {
 	if !b.Found(0) || b.Found(1) {
 		t.Fatal("pattern split across writes must be found; absent must not")
 	}
+	big := NewBuffer(100, nil) // a single write larger than the limit
+	big.Write([]byte("HEAD" + strings.Repeat("x", 500) + "TAIL"))
+	if s := big.String(); !strings.HasPrefix(s, "HEAD") || !strings.HasSuffix(s, "TAIL") || !strings.Contains(s, "[truncated 408 bytes]") {
+		t.Fatalf("oversized first write: %q", s)
+	}
 	small := NewBuffer(100, nil)
 	small.Write([]byte("hi"))
 	if small.String() != "hi" || small.Truncated() {

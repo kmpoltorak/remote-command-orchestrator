@@ -187,7 +187,7 @@ func TestExecOutputLimitAndPatterns(t *testing.T) {
 		t.Fatal("streaming pattern search must see dropped output")
 	}
 	if !strings.HasPrefix(r.Stdout, "line-0-") || !strings.Contains(r.Stdout, "line-4999-") {
-		t.Fatal("head and tail must be kept")
+		t.Fatalf("head and tail must be kept: head=%q tail=%q", r.Stdout[:40], r.Stdout[len(r.Stdout)-120:])
 	}
 }
 

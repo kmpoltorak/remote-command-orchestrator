@@ -269,24 +269,21 @@ func TestPrepareValidatesEverythingBeforeConnecting(t *testing.T) {
 }
 
 func TestBoundedConcurrencyManyHosts(t *testing.T) {
-	servers := []*sshtest.Server{
-		sshtest.Start(t, sshtest.Options{Password: "login-secret"}),
-		sshtest.Start(t, sshtest.Options{Password: "login-secret"}),
-	}
+	// One server so its peak counter sees every host at the same instant.
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
 	var targets []domain.Target
 	for i := range 250 {
-		targets = append(targets, target(fmt.Sprintf("host-%03d", i), servers[i%2]))
+		targets = append(targets, target(fmt.Sprintf("host-%03d", i), srv))
 	}
 	j := loadJob(t, "name: many\nsteps: [{name: s, command: 'sleep 0.05; echo done'}]", nil)
-	o := opts(sshtest.WriteKnownHosts(t, servers...))
+	o := opts(sshtest.WriteKnownHosts(t, srv))
 	o.Concurrency = 20
 	before := runtime.NumGoroutine()
 	rep := runJob(t, context.Background(), Input{Job: j, Targets: targets}, o)
 	if rep.Summary.Success != 250 {
 		t.Fatalf("%v", rep.Summary)
 	}
-	peak := servers[0].PeakConcurrent() + servers[1].PeakConcurrent()
-	if peak > 20 || peak < 4 {
+	if peak := srv.PeakConcurrent(); peak > 20 || peak < 4 {
 		t.Fatalf("peak concurrent commands %d, want between 4 and 20", peak)
 	}
 	for i, h := range rep.Hosts { // report order matches input order
