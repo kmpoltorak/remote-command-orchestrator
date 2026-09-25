@@ -10,7 +10,7 @@ import (
 )
 
 func TestExamplesLoad(t *testing.T) {
-	files, _ := filepath.Glob("../../examples/jobs/*.yaml")
+	files, _ := filepath.Glob("../../examples/jobs/*/job.yaml")
 	if len(files) < 3 {
 		t.Fatalf("expected examples, got %d", len(files))
 	}
@@ -23,6 +23,16 @@ func TestExamplesLoad(t *testing.T) {
 		if len(j.Hash) != 64 {
 			t.Errorf("%s: hash %q", f, j.Hash)
 		}
+	}
+}
+
+func TestLoadDirectory(t *testing.T) {
+	j, err := Load("../../examples/jobs/configure-ntp")
+	if err != nil || j.Name != "configure-ntp" || j.Path != filepath.Join("../../examples/jobs/configure-ntp", DefaultFile) {
+		t.Fatalf("%v %+v", err, j)
+	}
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Fatal("directory without job.yaml must fail")
 	}
 }
 

@@ -85,4 +85,10 @@ func TestRedactor(t *testing.T) {
 	if strings.Contains(got, "hunter22") || !strings.Contains(got, " ab") {
 		t.Fatalf("got %s", got)
 	}
+	for range 1000 {
+		r.Add("hunter22")
+	}
+	if len(r.secrets) != 2 {
+		t.Fatalf("duplicates must be ignored, have %d secrets", len(r.secrets))
+	}
 }

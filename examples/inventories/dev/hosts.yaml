@@ -1,0 +1,17 @@
+# Development environment: one box per role.
+credentials:
+  dev-password:
+    type: password
+    username: dev
+    password_env: DEV_PASSWORD        # also used for sudo
+
+defaults:
+  credential: dev-password
+  variables:
+    ntp_server: pool.ntp.org
+    db_user: app_dev
+
+hosts:
+  - name: dev-01
+    address: 10.40.1.10
+    tags: [web, db]

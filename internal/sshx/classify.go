@@ -52,7 +52,7 @@ func ClassifyHandshake(err error, addr string, timedOut bool) *domain.Failure {
 			return domain.Fail(domain.CatHostKeyMismatch, "host key for %s does not match known_hosts (possible man-in-the-middle)", addr)
 		}
 		host, port, _ := net.SplitHostPort(addr)
-		return domain.Fail(domain.CatHostKeyUnknown, "host key for %s is not in known_hosts (verify the fingerprint, then: ssh-keyscan -p %s %s >> ~/.ssh/known_hosts)", addr, port, host)
+		return domain.Fail(domain.CatHostKeyUnknown, "host key for %s is not in known_hosts (verify the fingerprint, then: ssh-keyscan -p %s %s >> ~/.ssh/known_hosts, or run with --accept-new-host-keys)", addr, port, host)
 	case strings.Contains(msg, "unable to authenticate"), strings.Contains(msg, "no supported methods remain"):
 		return domain.Fail(domain.CatAuthFailed, "authentication failed for %s", addr)
 	case timedOut:

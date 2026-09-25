@@ -38,12 +38,17 @@ const (
 const usage = `rco — run commands, scripts and file uploads on many Linux hosts over SSH
 
 Usage:
-  rco run      --inventory FILE --job FILE [selectors] [options]
-  rco validate --job FILE [--inventory FILE [selectors]]
+  rco run      --inventory FILE --job JOB [selectors] [options]   preview only
+  rco run      --inventory FILE --job JOB [selectors] --execute   apply changes
+  rco validate --job JOB [--inventory FILE [selectors]]
+
+JOB is a job directory (containing job.yaml) or a job YAML file.
   rco version
 
 Selectors (repeatable; AND across kinds, OR within a kind; none = all hosts):
-  --group NAME   --tag NAME   --host NAME
+  -g/--group NAME   -t/--tag NAME   -H/--host NAME
+
+Short flags: -i inventory, -j job, -c concurrency, -o output, -v verbose, -q quiet.
 
 Run "rco run -h" for all options.
 `
@@ -87,7 +92,7 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 		o                                  runner.Options
 	)
 	invPath := fs.String("inventory", "", "inventory YAML file")
-	jobPath := fs.String("job", "", "job YAML file")
+	jobPath := fs.String("job", "", "job directory (with job.yaml) or job YAML file")
 	fs.Var(&groups, "group", "select hosts in group (repeatable)")
 	fs.Var(&tags, "tag", "select hosts with tag (repeatable)")
 	fs.Var(&hosts, "host", "select host by name (repeatable)")
@@ -102,12 +107,21 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	fs.DurationVar(&o.MaxRetryDelay, "max-retry-delay", 30*time.Second, "maximum delay between connection retries")
 	fs.IntVar(&o.MaxOutput, "max-output", 1<<20, "bytes of stdout/stderr kept per step (head and tail are kept)")
 	fs.StringVar(&o.KnownHosts, "known-hosts", "~/.ssh/known_hosts", "known_hosts file used to verify host keys")
+	fs.BoolVar(&o.AcceptNewHosts, "accept-new-host-keys", false, "add keys of hosts missing from known_hosts (trust on first use); changed keys still fail")
 	fs.BoolVar(&o.Insecure, "insecure-skip-host-key-check", false, "INSECURE: do not verify host keys (lab use only)")
 	output := fs.String("output", "table", "result format on stdout: table, json or yaml")
 	reportPath := fs.String("report", "", "also write the full report to FILE (.json, .yaml or .yml)")
-	dryRun := fs.Bool("dry-run", false, "validate and print what would run on each host, without connecting")
+	execute := fs.Bool("execute", false, "actually run the job; without it rco only previews what would run, without connecting")
 	verbose := fs.Bool("verbose", false, "table output: include every step with its output")
 	quiet := fs.Bool("quiet", false, "log only warnings and errors")
+	// Short aliases share the long flag's value. --execute deliberately has
+	// none: applying changes should always be typed out in full.
+	for short, long := range map[string]string{
+		"i": "inventory", "j": "job", "g": "group", "t": "tag", "H": "host",
+		"c": "concurrency", "o": "output", "v": "verbose", "q": "quiet",
+	} {
+		fs.Var(fs.Lookup(long).Value, short, "short for --"+long)
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return ExitOK
@@ -162,7 +176,8 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	if in.VarEnv, err = pairs(varEnvs, "--var-env"); err != nil {
 		return fail("%v", err)
 	}
-	o.SkipCredentials = *dryRun
+	// A preview must work without access to keys and passwords; validate checks them.
+	o.SkipCredentials = !*execute && !validateOnly
 	r, err := runner.Prepare(in, o)
 	if err != nil {
 		return fail("validation failed, no host was contacted:\n%v", err)
@@ -171,8 +186,8 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 		fmt.Fprintf(stdout, "job %q is valid for %d hosts\n", j.Name, len(targets))
 		return ExitOK
 	}
-	if *dryRun {
-		return printDryRun(stdout, *output, r)
+	if !*execute {
+		return printPreview(stdout, *output, r)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -294,7 +309,7 @@ type dryStep struct {
 	Timeout string `json:"timeout" yaml:"timeout"`
 }
 
-func printDryRun(w io.Writer, format string, r *runner.Runner) int {
+func printPreview(w io.Writer, format string, r *runner.Runner) int {
 	var out []dryHost
 	for _, p := range r.Plans {
 		d := dryHost{Host: p.Target.Name, Address: p.Target.Addr(), User: p.Target.Username}
@@ -326,6 +341,6 @@ func printDryRun(w io.Writer, format string, r *runner.Runner) int {
 			fmt.Fprintf(w, "  %d. %-20s %s%s\n", i+1, s.Name, sudo, s.Command)
 		}
 	}
-	fmt.Fprintf(w, "\ndry run: %d hosts, nothing was executed\n", len(out))
+	fmt.Fprintf(w, "\npreview: %d hosts, nothing was executed. Add --execute to apply.\n", len(out))
 	return ExitOK
 }

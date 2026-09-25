@@ -6,7 +6,9 @@ package sshtest
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -37,12 +39,13 @@ type Options struct {
 
 // Server is a running test SSH server.
 type Server struct {
-	Addr    string
-	Dir     string // working directory and $HOME of every command
-	HostKey ssh.Signer
-	opts    Options
-	ln      net.Listener
-	binDir  string
+	Addr     string
+	Dir      string     // working directory and $HOME of every command
+	HostKey  ssh.Signer // ed25519; the one written to known_hosts by default
+	ECDSAKey ssh.Signer // second host key, like real sshd servers offer
+	opts     Options
+	ln       net.Listener
+	binDir   string
 
 	Conns    atomic.Int64 // accepted, authenticated connections
 	Sessions atomic.Int64
@@ -68,7 +71,12 @@ func Start(t testing.TB, o Options) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{Addr: ln.Addr().String(), Dir: t.TempDir(), HostKey: signer, opts: o, ln: ln, binDir: t.TempDir()}
+	ecPriv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ecSigner, err := ssh.NewSignerFromKey(ecPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Addr: ln.Addr().String(), Dir: t.TempDir(), HostKey: signer, ECDSAKey: ecSigner, opts: o, ln: ln, binDir: t.TempDir()}
 	if err := os.WriteFile(filepath.Join(s.binDir, "sudo"), []byte(fakeSudo), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +99,7 @@ func Start(t testing.TB, o Options) *Server {
 		}
 	}
 	cfg.AddHostKey(signer)
+	cfg.AddHostKey(ecSigner)
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -114,10 +123,13 @@ func (s *Server) Commands() []string {
 // PeakConcurrent is the highest number of simultaneously running commands.
 func (s *Server) PeakConcurrent() int64 { return s.peak.Load() }
 
-// KnownHostsLine returns a known_hosts entry trusting this server.
-func (s *Server) KnownHostsLine() string {
+// KnownHostsLine returns a known_hosts entry trusting this server's ed25519 key.
+func (s *Server) KnownHostsLine() string { return s.KnownHostsLineFor(s.HostKey.PublicKey()) }
+
+// KnownHostsLineFor returns a known_hosts entry for one of the server's keys.
+func (s *Server) KnownHostsLineFor(k ssh.PublicKey) string {
 	_, port, _ := net.SplitHostPort(s.Addr)
-	return fmt.Sprintf("[127.0.0.1]:%s %s", port, ssh.MarshalAuthorizedKey(s.HostKey.PublicKey()))
+	return fmt.Sprintf("[127.0.0.1]:%s %s", port, ssh.MarshalAuthorizedKey(k))
 }
 
 // WriteKnownHosts writes a known_hosts file trusting the given servers.

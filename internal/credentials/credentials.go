@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -116,12 +117,13 @@ type Redactor struct {
 	secrets []string
 }
 
-// Add registers secrets.
+// Add registers secrets. Duplicates are ignored: the same --var-env value is
+// registered once per host, and 30 000 copies would make every call slow.
 func (r *Redactor) Add(secrets ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, s := range secrets {
-		if len(s) >= MinSecretLen {
+		if len(s) >= MinSecretLen && !slices.Contains(r.secrets, s) {
 			r.secrets = append(r.secrets, s)
 		}
 	}

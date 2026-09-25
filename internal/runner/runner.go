@@ -33,6 +33,7 @@ type Options struct {
 	MaxRetryDelay    time.Duration
 	MaxOutput        int // retained bytes per step stream
 	KnownHosts       string
+	AcceptNewHosts   bool // add keys of unknown hosts to KnownHosts; changed keys still fail
 	Insecure         bool
 	Env              credentials.Env
 	Logger           *slog.Logger
@@ -77,7 +78,7 @@ func Prepare(in Input, o Options) (*Runner, error) {
 	r.dialer = &sshx.Dialer{
 		ConnectTimeout:   o.ConnectTimeout,
 		HandshakeTimeout: o.HandshakeTimeout,
-		HostKeys:         &sshx.HostKeys{Path: credentials.ExpandHome(o.KnownHosts), Insecure: o.Insecure, Logger: o.Logger},
+		HostKeys:         &sshx.HostKeys{Path: credentials.ExpandHome(o.KnownHosts), Insecure: o.Insecure, AcceptNew: o.AcceptNewHosts, Logger: o.Logger},
 	}
 	auths := map[string]*credentials.Auth{} // one secret lookup per credential
 	resolve := func(c domain.Credential) (*credentials.Auth, error) {
