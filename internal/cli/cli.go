@@ -35,7 +35,7 @@ const (
 	ExitHostsFailed = 2 // run finished but at least one host failed or was cancelled
 )
 
-const usage = `rco — run commands, scripts and file uploads on many Linux hosts over SSH
+const usage = `RCO — run commands, scripts and file uploads on many Linux hosts over SSH
 
 Usage:
   rco run      -i INVENTORY -j JOB [selectors] [options]              preview only
@@ -106,7 +106,7 @@ func newFlags(name string) *flags {
 	fs.Var(&f.groups, "group", "select hosts in group `NAME` (repeatable)")
 	fs.Var(&f.tags, "tag", "select hosts with tag `NAME` (repeatable)")
 	fs.Var(&f.hosts, "host", "select host `NAME` (repeatable)")
-	fs.BoolVar(&f.execute, "execute", false, "actually run the job; without it rco only previews, connecting to nothing")
+	fs.BoolVar(&f.execute, "execute", false, "actually run the job; without it RCO only previews, connecting to nothing")
 	fs.Var(&f.vars, "var", "job variable `NAME=VALUE` (repeatable)")
 	fs.Var(&f.varEnvs, "var-env", "job variable `NAME=ENV_VAR` read from the environment; required for sensitive variables (repeatable)")
 	fs.IntVar(&o.Concurrency, "concurrency", 100, "maximum hosts processed at the same time")

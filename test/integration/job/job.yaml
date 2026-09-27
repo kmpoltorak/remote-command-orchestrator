@@ -1,0 +1,32 @@
+name: integration
+max_failures: 1
+
+variables:
+  greeting: {default: hello}
+  token: {required: true, sensitive: true}
+
+steps:
+  - name: sudo-with-password
+    sudo: true
+    command: whoami
+    expect: {contains: root}
+
+  - name: script
+    script: scripts/check.sh
+    expect: {contains: "bash says hello"}
+
+  # /etc/rco-it/app.conf.rco-tmp is a planted symlink to /etc/victim (see Dockerfile).
+  - name: copy
+    sudo: true
+    copy: {src: files/app.conf.tmpl, dest: /etc/rco-it/app.conf, mode: "0640", template: true}
+
+  - name: verify-copy
+    sudo: true
+    command: stat -c '%a %U' /etc/rco-it/app.conf; cat /etc/rco-it/app.conf /etc/victim; ls -a /etc/rco-it
+    expect:
+      contains: ["640 root", "greeting=hello", "untouched"]
+      not_contains: ".rco-tmp."   # no temp file left behind
+
+  - name: secret
+    sensitive: true
+    command: test '{{ .token }}' = s3cret-value

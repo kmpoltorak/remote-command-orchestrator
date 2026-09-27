@@ -35,13 +35,13 @@ groups:
       tags: [production]
       variables: {ntp: group}
     hosts:
-      - {name: web-01, address: 10.0.0.1, variables: {ntp: host}}
-      - {name: web-02, address: 10.0.0.2, port: 22, tags: [canary]}
+      - {name: web-01, address: 192.0.2.1, variables: {ntp: host}}
+      - {name: web-02, address: 192.0.2.2, port: 22, tags: [canary]}
   db:
     hosts:
-      - {name: db-01, address: 10.0.1.1, username: postgres, bastion: b1}
+      - {name: db-01, address: 198.51.100.1, username: postgres, bastion: b1}
 hosts:
-  - {name: old-01, address: 10.0.2.1, credential: pw}
+  - {name: old-01, address: 203.0.113.1, credential: pw}
 `
 
 func TestResolveAndPrecedence(t *testing.T) {
@@ -110,7 +110,7 @@ func TestLoadMultipleFiles(t *testing.T) {
 		return p
 	}
 	common := write("common.yaml", "credentials: {key: {type: private_key, username: deploy, key_file: /k}}\ndefaults: {credential: key, variables: {ntp: common}}\n")
-	prod := write("prod.yaml", "groups: {web: {hosts: [{name: web-01, address: 10.0.0.1}]}}\nhosts: [{name: lb-01, address: 10.0.0.9}]\n")
+	prod := write("prod.yaml", "groups: {web: {hosts: [{name: web-01, address: 192.0.2.1}]}}\nhosts: [{name: lb-01, address: 192.0.2.9}]\n")
 	inv, err := Load(common, prod)
 	if err != nil {
 		t.Fatal(err)
@@ -123,8 +123,8 @@ func TestLoadMultipleFiles(t *testing.T) {
 		t.Fatal("prod.yaml alone lacks credentials and must fail")
 	}
 	for name, body := range map[string]string{
-		"dup-host.yaml":    "hosts: [{name: web-01, address: 10.0.0.2}]",
-		"dup-group.yaml":   "groups: {web: {hosts: [{name: web-99, address: 10.0.0.3}]}}",
+		"dup-host.yaml":    "hosts: [{name: web-01, address: 192.0.2.2}]",
+		"dup-group.yaml":   "groups: {web: {hosts: [{name: web-99, address: 192.0.2.3}]}}",
 		"dup-cred.yaml":    "credentials: {key: {type: private_key, username: x, key_file: /y}}",
 		"dup-default.yaml": "defaults: {port: 2222}",
 	} {

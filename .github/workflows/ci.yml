@@ -36,6 +36,25 @@ jobs:
         with:
           version: latest
 
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: integration tests (Docker)
+        run: make integration
+
+  shell-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck
+      - name: hadolint
+        run: git ls-files -z '*Dockerfile' | xargs -0 -I{} sh -c 'docker run --rm -i hadolint/hadolint < "$1"' _ {}
+
   vulncheck:
     runs-on: ubuntu-latest
     steps:
