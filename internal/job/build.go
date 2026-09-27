@@ -80,10 +80,12 @@ func (a Action) Remote(tmp string, sudoPassword bool) string {
 		// itself exits at once. POSIX sh only (works with busybox ash).
 		return wrap(fmt.Sprintf("(trap '' HUP; %s) </dev/null >/dev/null 2>&1 &", a.Shell))
 	case a.Kind == KindCopy:
-		// Copy to a temp name beside dest, then rename: readers never see a
+		// Copy to a new temp file beside dest, then rename: readers never see a
 		// partial file, and the file is owned by the (sudo) user doing the copy.
-		part := Quote(a.Dest + ".rco-tmp")
-		inner := fmt.Sprintf("cp %s %s && chmod %s %s && mv -f %s %s", Quote(tmp), part, a.Mode, part, part, Quote(a.Dest))
+		// mktemp creates the file, so cp cannot follow a planted symlink.
+		dest := Quote(a.Dest)
+		inner := fmt.Sprintf(`p=$(mktemp "$(dirname %s)/.rco-tmp.XXXXXX") && { cp %s "$p" && chmod %s "$p" && mv -f "$p" %s || { rm -f "$p"; false; }; }`,
+			dest, Quote(tmp), a.Mode, dest)
 		return cleanup(wrap(inner), tmp)
 	}
 	return wrap(a.Shell)
@@ -136,6 +138,9 @@ func (j *Job) build(st Step, vars map[string]string, s Settings) (Action, error)
 	}
 	if st.Retries != nil {
 		a.Retries = *st.Retries
+	}
+	if a.Disconnect || a.FireAndForget {
+		a.Retries = 0 // the command must not run twice; defaults.retries does not apply
 	}
 	if st.Expect.ExitCode != nil {
 		a.ExitCode = *st.Expect.ExitCode

@@ -210,7 +210,12 @@ func TestJSONLReportAndOnlyFailed(t *testing.T) {
 	if code != ExitHostsFailed || json.Unmarshal([]byte(stdout), &r) != nil || r.Summary.Total != 1 || r.Hosts[0].Host != "web-02" {
 		t.Fatalf("%d %s %s", code, stdout, stderr)
 	}
-	// A preview must not leave an empty report behind.
+	// A preview must neither touch an existing report nor create a new one.
+	before := mustRead(rep)
+	main(t, "run", "-i", f.inv, "-j", f.job, "--report", rep)
+	if string(mustRead(rep)) != string(before) {
+		t.Fatal("preview must not overwrite an existing .jsonl report")
+	}
 	os.Remove(rep)
 	main(t, "run", "-i", f.inv, "-j", f.job, "--report", rep)
 	if _, err := os.Stat(rep); err == nil {

@@ -248,6 +248,20 @@ func TestExecOutputLimitAndPatterns(t *testing.T) {
 	}
 }
 
+func TestExecTimeoutCoversSessionStart(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "pw", HangExec: true})
+	start := time.Now()
+	_, err := Exec(context.Background(), connect(t, srv).Client, Request{Command: "true", Timeout: 300 * time.Millisecond, MaxOutput: 1024})
+	if category(err) != domain.CatCommandTimeout || time.Since(start) > 3*time.Second {
+		t.Fatalf("want COMMAND_TIMEOUT, got %v after %s", err, time.Since(start))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	if _, err := Exec(ctx, connect(t, srv).Client, Request{Command: "true", Timeout: time.Minute, MaxOutput: 1024}); category(err) != domain.CatCancelled {
+		t.Fatalf("want CANCELLED, got %v", err)
+	}
+}
+
 func TestSessionFailure(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "pw", RejectExec: true})
 	c := connect(t, srv)

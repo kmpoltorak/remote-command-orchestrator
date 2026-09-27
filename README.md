@@ -15,6 +15,31 @@ exactly what happened where.
 - Parallel with a hard limit (`--concurrency`). Ctrl+C cancels cleanly.
 - Output as a table, JSON or YAML, plus an optional report file. Secrets are masked everywhere.
 
+## Why not Ansible?
+
+Ansible is the right tool for most configuration management. rco exists for
+one case where it gets painful: pushing a change to many small devices over
+unreliable links, such as LTE routers at remote sites.
+
+| At fleet scale | Ansible, by default | rco |
+|---|---|---|
+| Connection drops silently (no TCP reset) | The task can hang until an outer timeout, or indefinitely, unless you add SSH keepalives and a task `timeout` | Every step has a timeout (default 5m) that also covers opening the SSH session; during `reboot`/`disconnect` steps keepalives every 5 s detect a dead session in about 15 s |
+| One slow host | `linear` strategy: each task waits for the slowest host before the next one starts | Each host runs its steps independently, capped by `--concurrency` |
+| Parallelism | `forks: 5`, one controller process per connection | `--concurrency 100`, one goroutine per host inside a single static binary |
+| Python on the target | Needed by most modules; OpenWrt and RutOS don't ship it, so only `raw` is left | Needs only a POSIX shell; tested on OpenWrt 23.05 with dropbear |
+| Commands that cut the uplink (SIM switch, network restart) | `async` / `poll: 0`, handled task by task | `fire_and_forget`, `disconnect`, and `reboot` with a boot-ID check |
+| Stopping a bad rollout | `max_fail_percentage`, optional | `max_failures`, required in every job |
+
+Most of this can be tuned in Ansible (the `free` strategy, more forks, SSH
+keepalives, Mitogen). rco makes it the default and drops the Python dependency.
+
+Reported hangs and drops: ansible/ansible
+[#30411](https://github.com/ansible/ansible/issues/30411),
+[#18305](https://github.com/ansible/ansible/issues/18305),
+[#69854](https://github.com/ansible/ansible/issues/69854),
+[#20100](https://github.com/ansible/ansible/issues/20100),
+[#77325](https://github.com/ansible/ansible/issues/77325).
+
 ```text
 $ rco run --inventory hosts.yaml --job jobs/configure-ntp --group web --var ntp_server=ntp1.example.com --execute
 HOST     STATUS   FAILED STEP  REASON                                   DURATION
@@ -33,7 +58,6 @@ for Linux (amd64, arm64, armv7) or macOS (Intel, Apple Silicon). The binary is
 static and has no dependencies:
 
 ```bash
-# the repository is private, so use the GitHub CLI (or the web page)
 gh release download --repo kmpoltorak/remote-command-orchestrator --pattern '*darwin_arm64.tar.gz'
 tar -xzf rco_*_darwin_arm64.tar.gz && sudo mv rco_*/rco /usr/local/bin/
 rco version
@@ -42,14 +66,13 @@ rco version
 Or build it yourself:
 
 ```bash
-# the repository is private: let Go fetch it with your git credentials
-GOPRIVATE=github.com/kmpoltorak/* go install github.com/kmpoltorak/remote-command-orchestrator/cmd/rco@latest
+go install github.com/kmpoltorak/remote-command-orchestrator/cmd/rco@latest
 # or from a checkout:
 make build        # -> bin/rco
 ```
 
 Requires Go 1.27+ to build. Target hosts need `sh`, `bash` (for `script` steps),
-`mktemp`, `cp`, `chmod` and `mv`, which every mainstream Linux distribution has, plus
+`mktemp`, `dirname`, `cp`, `chmod` and `mv`, which every mainstream Linux distribution has, plus
 `sudo` if steps use it.
 
 ## Quick start
@@ -187,15 +210,15 @@ Each step has exactly one of these:
 |---|---|
 | `command: <text>` | Runs through the login shell, as with `ssh host '<text>'`. |
 | `script: <file>` | The local file is uploaded to a private temp file (0600) and run with `bash`, then deleted. Job variables are exported at the top of the script (`$ntp_server`). |
-| `copy: {src, dest, mode, template}` | The local file is uploaded, copied next to `dest`, given `mode`, then renamed over `dest`. Readers never see a half-written file. With `sudo: true` the file ends up owned by root. |
+| `copy: {src, dest, mode, template}` | The local file is uploaded, copied to a new temp file (`mktemp`) next to `dest`, given `mode`, then renamed over `dest`. Readers never see a half-written file. With `sudo: true` the file ends up owned by root. |
 
 ### Step options
 
 | Option | Default | Meaning |
 |---|---|---|
 | `sudo` | `defaults.sudo` | Run the step as root through sudo. |
-| `timeout` | `defaults.timeout`, else `--timeout` (5m) | The command is killed when this is exceeded (`COMMAND_TIMEOUT`). |
-| `retries` / `retry_delay` | 0 / 2s | Re-run the step if it fails or times out. |
+| `timeout` | `defaults.timeout`, else `--timeout` (5m) | The command is killed when this is exceeded (`COMMAND_TIMEOUT`). The limit also covers opening the SSH session; if that hangs, the connection is closed. |
+| `retries` / `retry_delay` | `defaults.retries` (0) / 2s | Re-run the step if it fails or times out. Never applies to `reboot`, `disconnect` or `fire_and_forget` steps. |
 | `continue_on_error` | `false` | Record the failure but keep going. The host is still reported as `FAILED`. |
 | `sensitive` | `false` | Mask the command and output in all output (`[SENSITIVE]`). The command is also sent as a temp file, so it never shows up in the remote process list. |
 | `expect` | exit code 0 | See below. |
@@ -255,8 +278,9 @@ steps:
   immediately: they don't fix themselves, and a changed host key must never be
   retried.
 - A real failure while the connection is alive, such as a non-zero exit code or an
-  unmet expectation, is still a failure. `retries` cannot be combined with these
-  options, because the command must not run twice.
+  unmet expectation, is still a failure. So is a command the host refused to
+  start. `retries` cannot be combined with these options, and `defaults.retries`
+  does not apply to them, because the command must not run twice.
 - The report shows a `note` such as `host rebooted (new boot ID) and was back after 48s`.
 
 `examples/jobs/kernel-update` upgrades packages, reboots and verifies the host.
@@ -274,7 +298,8 @@ steps:
 
 `rco` starts the command in the background, detached from the SSH session
 (it ignores SIGHUP and has no terminal), so it keeps running when the
-connection drops. The step succeeds as soon as the command has started, and
+connection drops. The step succeeds as soon as the command has started (if the
+session cannot be opened or the host refuses to run it, the step fails), and
 the command's exit code and output are never looked at. Because the connection
 may be gone afterwards, a `fire_and_forget` step must be the last step, and it
 cannot be combined with `reboot`, `disconnect`, `retries`, `sensitive` or
@@ -287,7 +312,7 @@ dropbear and was tested against OpenWrt 23.05. On OpenWrt:
 
 - Log in as `root` and don't use `sudo`, which isn't installed.
 - Use `command:` steps. `script:` steps run with `bash`, which OpenWrt doesn't ship.
-- `copy:` works: it needs only `mktemp`, `cp`, `chmod` and `mv`.
+- `copy:` works: it needs only `mktemp`, `dirname`, `cp`, `chmod` and `mv`.
 
 `examples/jobs/openwrt-sim-switch` switches the SIM on Teltonika RutOS routers,
 with `examples/inventories/prod/routers.yaml`.
@@ -331,8 +356,9 @@ DB_PASSWORD=... rco run ... --var-env db_password=DB_PASSWORD --execute
 `rco` refuses sensitive values given with `--var` or in the inventory, and refuses
 a non-sensitive step that uses a sensitive variable. The values of every
 secret are replaced with `[REDACTED]` wherever they would appear in output,
-reports or errors. This covers passwords, key passphrases, sudo passwords and
-`--var-env` values.
+reports or errors, including the rendered commands in the preview and reports.
+This covers passwords, key passphrases, sudo passwords and `--var-env` values,
+even for variables not declared `sensitive`.
 
 ## Inventory
 
@@ -557,7 +583,8 @@ without connecting.
 ```
 
 `hash` is the SHA-256 of the job file plus every script and uploaded file, so a
-report identifies exactly what ran. Report files are created with mode 0600.
+report identifies exactly what ran. Report files are created with mode 0600 and
+written only with `--execute`; a preview leaves an existing report untouched.
 
 With a `.jsonl` file name, `--report` writes one JSON line per host **as soon
 as the host finishes**, then a final line with the summary. If `rco` itself is
