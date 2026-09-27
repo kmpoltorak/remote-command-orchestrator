@@ -11,5 +11,5 @@ One line per proposal the maintainer rejected or changed in review. Source for t
 - 2026-09-25 · PR #2 · one general reconnect mechanism (with an `expect.rebooted`-style check) for steps that lose the connection · three simple flags: `reboot`, `disconnect`, `fire_and_forget` · the general version was too complex to reason about
 - 2026-09-25 · PR #2 · `--max-failures` as an optional command-line flag · `max_failures` required in every job file; the flag only overrides it · whoever writes the job must decide how much breakage is acceptable
 - 2026-09-27 · PR #4 · README install section saying the repository is private, with `GOPRIVATE` · removed; plain `go install …@latest` · the repository is public
-- 2026-09-27 · PR #5 · README halucinations were removed
-- 2026-09-27 · PR #5 · add `CHANGELOG.md` · users of the binaries need to see what changed between releases
+- 2026-09-27 · PR #5 · README claims "tested against OpenWrt 23.05" and "tested with 100 hosts and 50 parallel tunnels" · removed as hallucinations · no test in the repo backs them
+- 2026-09-27 · PR #5 · no CHANGELOG (decided earlier) · add `CHANGELOG.md` · users of the binaries need to see what changed between releases

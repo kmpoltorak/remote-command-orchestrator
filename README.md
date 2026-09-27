@@ -773,8 +773,11 @@ connection get simple, explicit flags, not a general mechanism.
 - Made `max_failures` a required field in every job instead of an optional flag
   ([#2](https://github.com/kmpoltorak/remote-command-orchestrator/pull/2)): the job
   author must decide how much breakage is acceptable.
-- Removed README claims that came from manual runs, not from tests in the repo
+- Removed README claims that no test in the repo backs, as hallucinations
   ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5)).
+- Reversed an earlier "no CHANGELOG" decision and added `CHANGELOG.md`
+  ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5)): users of
+  the binaries need to see what changed between releases.
 
 **What the tests are there to catch:**
 - `copy` writing through a planted symlink as root → `TestIntegrationAlpine` (real
