@@ -38,9 +38,9 @@ groups:
       tags: [web]
     hosts:
       - name: web-01
-        address: 10.20.1.10
+        address: 192.0.2.10
       - name: web-02
-        address: 10.20.1.11
+        address: 192.0.2.11
         tags: [canary]                         # --tag canary: roll out here first
 
   db:
@@ -49,9 +49,9 @@ groups:
       credential: deploy-key-encrypted
     hosts:
       - name: db-01
-        address: 10.50.2.10
+        address: 198.51.100.10
       - name: db-02
-        address: 10.50.2.11
+        address: 198.51.100.11
         port: 2222
         variables:
           ntp_server: ntp2.example.com         # host value wins over defaults
@@ -61,4 +61,4 @@ groups:
       credential: legacy-password
     hosts:
       - name: old-app-01
-        address: 10.20.9.5
+        address: 203.0.113.5

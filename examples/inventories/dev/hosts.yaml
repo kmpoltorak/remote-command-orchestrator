@@ -13,5 +13,5 @@ defaults:
 
 hosts:
   - name: dev-01
-    address: 10.40.1.10
+    address: 192.0.2.40
     tags: [web, db]

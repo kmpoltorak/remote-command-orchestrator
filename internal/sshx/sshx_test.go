@@ -176,7 +176,7 @@ func TestConnectionFailures(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := d.Dial(ctx, Hop{Addr: "10.255.255.1:22"}, nil); category(err) != domain.CatConnectionTimeout {
+	if _, err := d.Dial(ctx, Hop{Addr: "192.0.2.1:22"}, nil); category(err) != domain.CatConnectionTimeout {
 		t.Fatalf("want CONNECTION_TIMEOUT, got %v", err)
 	}
 	if _, err := d.Dial(context.Background(), Hop{Addr: "no-such-host.invalid:22"}, nil); category(err) != domain.CatDNSFailure {
