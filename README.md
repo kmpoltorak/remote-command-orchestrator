@@ -729,7 +729,8 @@ variable that must not appear in the output. CI runs it as a separate job.
 The tests start real SSH servers in-process (`internal/sshtest`). They run
 genuine shell commands in temp directories with a fake `sudo`, so the whole
 suite runs offline in a few seconds. The test server can also drop a connection
-mid-command, simulate a reboot with a new boot ID, refuse or never answer an
+mid-command, go silent without closing it (a link cut with no TCP reset),
+simulate a reboot with a new boot ID, refuse or never answer an
 exec request, and act as a bastion.
 
 Failure modes covered:
@@ -739,6 +740,7 @@ Failure modes covered:
 | Command hangs; Ctrl+C mid-command | `TestExecTimeoutAndCancel`, `TestCancellation` |
 | Server never answers the exec request | `TestExecTimeoutCoversSessionStart` |
 | Connection dies mid-command without a status | `TestUnexpectedDisconnectIsAFailure` |
+| Silent link cut (no TCP reset) during a `disconnect` step: keepalives find it long before the step timeout | `TestSilentDropDetectedByKeepalive` |
 | Host refuses to start the command | `TestSessionFailure`, `TestFireAndForgetRefusedExecFails` |
 | Reboot: host back with a new boot ID, never back, or not rebooted | `TestRebootStep`, `TestRebootHostDoesNotComeBack`, `TestRebootRequiresNewBootID` |
 | Expected disconnect; a disconnect step never runs twice | `TestDisconnectStep`, `TestDisconnectIgnoresDefaultRetries` |
@@ -784,6 +786,9 @@ connection get simple, explicit flags, not a general mechanism.
 - `copy` writing through a planted symlink as root → `TestIntegrationAlpine` (real
   sshd and GNU coreutils in Docker), sabotage-checked
   ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5))
+- Silent link cut found only by the step timeout instead of keepalives →
+  `TestSilentDropDetectedByKeepalive`, sabotage-checked
+  ([#8](https://github.com/kmpoltorak/remote-command-orchestrator/pull/8))
 - Hung session setup ignoring timeout and Ctrl+C → `TestExecTimeoutCoversSessionStart`,
   sabotage-checked ([#4](https://github.com/kmpoltorak/remote-command-orchestrator/pull/4))
 - Refused `fire_and_forget` reported as success → `TestFireAndForgetRefusedExecFails`,
