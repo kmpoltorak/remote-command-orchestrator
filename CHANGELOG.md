@@ -4,6 +4,10 @@ All notable changes to RCO. Versions follow [Semantic Versioning](https://semver
 
 ## [Unreleased]
 
+### Fixed
+- Flaky "connection refused" tests: they freed a port and expected it to stay closed,
+  but a test server in a parallel package could take it. They now use a privileged port.
+
 ## [1.0.2] - 2026-09-27
 
 ### Added
