@@ -3,4 +3,5 @@
 set -euo pipefail
 systemctl restart chrony
 systemctl is-active --quiet chrony
+# shellcheck disable=SC2154 # exported by RCO, see above
 echo "chrony restarted, upstream ${ntp_server}"

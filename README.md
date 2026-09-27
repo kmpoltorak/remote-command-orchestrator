@@ -35,7 +35,7 @@ unreliable links, such as LTE routers at remote sites.
 | Connection drops silently (no TCP reset) | The task can hang until an outer timeout, or indefinitely, unless you add SSH keepalives and a task `timeout` | Every step has a timeout (default 5m) that also covers opening the SSH session; during `reboot`/`disconnect` steps keepalives every 5 s detect a dead session in about 15 s |
 | One slow host | `linear` strategy: each task waits for the slowest host before the next one starts | Each host runs its steps independently, capped by `--concurrency` |
 | Parallelism | `forks: 5`, one controller process per connection | `--concurrency 100`, one goroutine per host inside a single static binary |
-| Python on the target | Needed by most modules; OpenWrt and RutOS don't ship it, so only `raw` is left | Needs only a POSIX shell; tested on OpenWrt 23.05 with dropbear |
+| Python on the target | Needed by most modules; OpenWrt and RutOS don't ship it, so only `raw` is left | Needs only a POSIX shell and basic tools (`mktemp`, `cp`, `mv`…); `bash` only for `script:` steps |
 | Commands that cut the uplink (SIM switch, network restart) | `async` / `poll: 0`, handled task by task | `fire_and_forget`, `disconnect`, and `reboot` with a boot-ID check |
 | Stopping a bad rollout | `max_fail_percentage`, optional | `max_failures`, required in every job |
 
@@ -318,8 +318,8 @@ cannot be combined with `reboot`, `disconnect`, `retries`, `sensitive` or
 
 ### OpenWrt and other minimal systems
 
-RCO needs only a POSIX shell and busybox tools on the host. It works with
-dropbear and was tested against OpenWrt 23.05. On OpenWrt:
+RCO needs only a POSIX shell and the basic tools listed under
+[Install](#install), which busybox provides. On OpenWrt:
 
 - Log in as `root` and don't use `sudo`, which isn't installed.
 - Use `command:` steps. `script:` steps run with `bash`, which OpenWrt doesn't ship.
@@ -638,8 +638,7 @@ rco run -i prod/hosts.yaml -j jobs/x --execute --only-failed run.jsonl --report 
   host through that one connection. Hosts that ask for the bastion at the same
   time wait for the same login. The bastion therefore never sees a storm of
   logins, and OpenSSH's `MaxStartups` limit doesn't apply. A lost bastion
-  connection is re-established on the next host. Tested with 100 hosts and 50
-  parallel tunnels through one OpenSSH bastion.
+  connection is re-established on the next host.
 - **Inventory size**: up to 64 MiB per file, and files can be split and
   combined with repeated `-i`.
 
@@ -680,6 +679,7 @@ It is git-ignored, so hosts and key paths never end up in a commit.
 | `internal/runner` | parallel execution, retries, expectations, report |
 | `internal/sshx` | SSH dial (with bastion), host keys, exec with bounded output |
 | `internal/sshtest` | in-process SSH server for tests |
+| `test/integration` | Docker target and job for `make integration` |
 
 ### Versions and releases
 
@@ -716,7 +716,14 @@ GitHub Release with generated notes. `make release` does the same locally into `
 ```bash
 make check                      # gofmt, go vet, go test -race, go build (same as CI)
 go test -race -count=1 ./...    # tests only
+make integration                # against a disposable Docker container (needs Docker)
 ```
+
+`make integration` builds `test/integration/Dockerfile` (Alpine with real OpenSSH,
+busybox `sh`, GNU coreutils, `bash` and sudo that asks for a password) and runs
+`test/integration/job` against it: password sudo, a `bash` script, a templated
+`copy` next to a planted symlink that must not be followed, and a sensitive
+variable that must not appear in the output. CI runs it as a separate job.
 
 The tests start real SSH servers in-process (`internal/sshtest`). They run
 genuine shell commands in temp directories with a fake `sudo`, so the whole
@@ -743,33 +750,54 @@ Failure modes covered:
 | Too many failed hosts stop the rollout | `TestMaxFailuresAndProgress`, `TestMaxFailuresFromJobAndOverride` |
 | Concurrency limit, shared bastion, goroutine leaks | `TestBoundedConcurrencyManyHosts`, `TestSharedBastion`, `TestNoGoroutineLeaks` |
 | Preview must not touch hosts or existing reports | `TestRunPreviewsByDefaultAndValidateDoesNotConnect`, `TestJSONLReportAndOnlyFailed` |
+| Real sshd, password sudo, `copy` next to a planted symlink (Docker) | `TestIntegrationAlpine` |
 
 ## How this was built
-
-<!-- TODO(Kris): fill in this section. Everything in <angle brackets> is yours to write. -->
-
-> **TODO:** this section is a placeholder for the maintainer to fill in.
 
 Built with an AI coding assistant. I wrote the problem statement and spec, reviewed
 every PR, and designed the checks below.
 
-**Spec:** <one paragraph: the constraints I set, e.g. "must not hang on a dead
-connection", "nothing touches a host without --execute">
+**Spec:** a single binary that pushes a change over SSH to Linux hosts and says
+exactly what happened on each. Nothing touches a host without `--execute`. Every
+host is validated before any host is contacted. No step may hang on a dead
+connection. Secrets never live in files and never appear in output. Every job
+must say how many failed hosts stop the rollout. Commands that cut their own
+connection get simple, explicit flags, not a general mechanism.
 
 **What I changed or rejected in review:** (from [docs/review-log.md](docs/review-log.md))
-- <concrete decision + why, link to PR>
-- <concrete decision + why, link to PR>
+- Rejected a full platform (database, REST server, queue, notifications) for a
+  Linux-only CLI: it was overkill for the problem.
+- Replaced a general reconnect mechanism with three flags, `reboot`, `disconnect`
+  and `fire_and_forget` ([#2](https://github.com/kmpoltorak/remote-command-orchestrator/pull/2)):
+  the general version was too complex to reason about.
+- Made `max_failures` a required field in every job instead of an optional flag
+  ([#2](https://github.com/kmpoltorak/remote-command-orchestrator/pull/2)): the job
+  author must decide how much breakage is acceptable.
+- Removed README claims that came from manual runs, not from tests in the repo
+  ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5)).
 
 **What the tests are there to catch:**
-- Hung session setup → `TestExecTimeoutCoversSessionStart`, sabotage-checked ([#4](https://github.com/kmpoltorak/remote-command-orchestrator/pull/4))
-- Refused `fire_and_forget` reported as success → `TestFireAndForgetRefusedExecFails`, sabotage-checked (#4)
-- `defaults.retries` re-running a disconnect step → `TestDisconnectIgnoresDefaultRetries`, sabotage-checked (#4)
-- `--var-env` value leaking into displayed commands → `TestVarEnvRedactedInCommand`, sabotage-checked (#4)
-- Preview overwriting an existing report → `TestJSONLReportAndOnlyFailed`, sabotage-checked (#4)
-- <failure mode> → <test name>, sabotage-checked
+- `copy` writing through a planted symlink as root → `TestIntegrationAlpine` (real
+  sshd and GNU coreutils in Docker), sabotage-checked
+  ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5))
+- Hung session setup ignoring timeout and Ctrl+C → `TestExecTimeoutCoversSessionStart`,
+  sabotage-checked ([#4](https://github.com/kmpoltorak/remote-command-orchestrator/pull/4))
+- Refused `fire_and_forget` reported as success → `TestFireAndForgetRefusedExecFails`,
+  sabotage-checked (#4)
+- `defaults.retries` re-running a disconnect step → `TestDisconnectIgnoresDefaultRetries`,
+  sabotage-checked (#4)
+- `--var-env` value leaking into displayed commands → `TestVarEnvRedactedInCommand`,
+  sabotage-checked (#4)
+- Preview overwriting an existing report → `TestJSONLReportAndOnlyFailed`,
+  sabotage-checked (#4)
 
 **What I don't trust yet / known gaps:**
-- <honest gap>
+- OpenWrt (dropbear, busybox) and a bastion with many parallel tunnels were only
+  checked by hand, not in CI.
+- Reboot and disconnect steps are tested only against the in-process test server,
+  not against a real sshd.
+- Inventory and `--var` values are inserted into shell commands as-is; they are
+  trusted input.
 
 ## License
 

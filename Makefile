@@ -4,7 +4,7 @@ LDFLAGS := -s -w -X github.com/kmpoltorak/remote-command-orchestrator/internal/c
 # Release targets: Linux (incl. 32-bit ARM for older Raspberry Pi) and macOS.
 PLATFORMS := linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64
 
-.PHONY: build test race lint vuln fmt check release clean
+.PHONY: build test race integration lint vuln fmt check release clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/rco ./cmd/rco
@@ -14,6 +14,10 @@ test:
 
 race:
 	go test -race ./...
+
+# Runs a job against a disposable Docker container (test/integration). Needs Docker.
+integration:
+	go test -tags integration -count=1 -run Integration ./internal/cli/
 
 lint:
 	golangci-lint run
