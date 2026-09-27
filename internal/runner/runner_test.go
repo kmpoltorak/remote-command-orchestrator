@@ -227,9 +227,7 @@ func writeKey(t *testing.T) (string, ssh.PublicKey) {
 
 func TestConnectionRetryAndAuth(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	ln.Close()
+	_, port, _ := net.SplitHostPort(sshtest.RefusedAddr)
 	dead := target("dead", srv)
 	dead.Port, _ = strconv.Atoi(port)
 	badAuth := target("bad-auth", srv)

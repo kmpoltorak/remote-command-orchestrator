@@ -150,10 +150,7 @@ func TestAcceptNewHostKeys(t *testing.T) {
 
 func TestConnectionFailures(t *testing.T) {
 	d := dialer("/dev/null")
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	closed := ln.Addr().String()
-	ln.Close()
-	if _, err := d.Dial(context.Background(), Hop{Addr: closed}, nil); category(err) != domain.CatConnectionRefused {
+	if _, err := d.Dial(context.Background(), Hop{Addr: sshtest.RefusedAddr}, nil); category(err) != domain.CatConnectionRefused {
 		t.Fatalf("want CONNECTION_REFUSED, got %v", err)
 	}
 
@@ -326,10 +323,7 @@ func TestSharedBastion(t *testing.T) {
 	}
 
 	// A target the bastion cannot reach does not break the shared connection.
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	closed := ln.Addr().String()
-	ln.Close()
-	if _, err := d.Dial(context.Background(), Hop{Addr: closed, User: "x"}, &b); category(err) != domain.CatConnectionRefused {
+	if _, err := d.Dial(context.Background(), Hop{Addr: sshtest.RefusedAddr, User: "x"}, &b); category(err) != domain.CatConnectionRefused {
 		t.Fatalf("want CONNECTION_REFUSED, got %v", err)
 	}
 	if c, err := d.Dial(context.Background(), hop(targets[0], "pw"), &b); err != nil {

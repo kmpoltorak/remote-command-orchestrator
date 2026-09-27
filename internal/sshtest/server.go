@@ -28,6 +28,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// RefusedAddr refuses connections. A port freed with Listen+Close is not
+// safe: a test server in a parallel package can take it in between. Test
+// servers only get ephemeral ports, never a privileged one like 1.
+const RefusedAddr = "127.0.0.1:1"
+
 // Options configure a server.
 type Options struct {
 	User          string // default "deploy"
