@@ -36,6 +36,7 @@ type Options struct {
 	SudoPassword  string // fake sudo requires this with -S; empty = NOPASSWD
 	AllowForward  bool   // act as a bastion (direct-tcpip)
 	RejectExec    bool   // accept sessions but refuse exec requests
+	HangExec      bool   // accept sessions but never answer exec requests
 }
 
 // Server is a running test SSH server.
@@ -227,6 +228,9 @@ func (s *Server) newBootID() {
 func (s *Server) session(sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	for req := range reqs {
+		if req.Type == "exec" && s.opts.HangExec {
+			continue // no reply: the client blocks in Start
+		}
 		if req.Type != "exec" || s.opts.RejectExec {
 			_ = req.Reply(false, nil)
 			continue

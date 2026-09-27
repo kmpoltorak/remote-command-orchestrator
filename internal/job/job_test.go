@@ -184,7 +184,8 @@ steps:
 	}
 	a := acts[3]
 	if string(a.Content) != "server ntp1\n" || a.Mode != "0644" || !strings.Contains(a.Display, "mode 0644") ||
-		!strings.Contains(a.Remote("/tmp/t", false), `mv -f '\''/etc/x y.conf.rco-tmp'\'' '\''/etc/x y.conf'\''`) {
+		!strings.Contains(a.Remote("/tmp/t", false), `mktemp "$(dirname '\''/etc/x y.conf'\'')/.rco-tmp.XXXXXX"`) ||
+		!strings.Contains(a.Remote("/tmp/t", false), `mv -f "$p" '\''/etc/x y.conf'\''`) {
 		t.Fatalf("copy: %q", a.Remote("/tmp/t", false))
 	}
 	if a := acts[4]; a.Display != "[SENSITIVE]" {

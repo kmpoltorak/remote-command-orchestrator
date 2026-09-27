@@ -510,6 +510,37 @@ steps:
 	t.Fatal("background command did not complete after the connection closed")
 }
 
+func TestFireAndForgetRefusedExecFails(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret", RejectExec: true})
+	j := loadJob(t, "name: ff\nsteps: [{name: switch, command: 'true', fire_and_forget: true}]", nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	if h := rep.Hosts[0]; h.Status != domain.StatusFailed || h.Category != domain.CatSessionFailed || h.Steps[0].Note != "" {
+		t.Fatalf("a command that never started must fail: %+v", h)
+	}
+}
+
+func TestDisconnectIgnoresDefaultRetries(t *testing.T) {
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, "name: n\ndefaults: {retries: 2, retry_delay: 1ms}\nsteps: [{name: s, command: 'exit 1', disconnect: true}]", nil)
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	if n := strings.Count(strings.Join(srv.Commands(), "\n"), "exit 1"); n != 1 || rep.Hosts[0].Steps[0].Attempts != 1 {
+		t.Fatalf("a disconnect step must run once, ran %d times", n)
+	}
+}
+
+func TestVarEnvRedactedInCommand(t *testing.T) {
+	j := loadJob(t, "name: n\nvariables: {token: {}}\nsteps: [{name: s, command: 'echo {{ .token }}'}]", nil)
+	o := opts("")
+	o.SkipCredentials = true
+	r, err := Prepare(Input{Job: j, Targets: []domain.Target{{Endpoint: domain.Endpoint{Name: "h1"}}}, VarEnv: map[string]string{"token": "DB_PW"}}, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := r.Plans[0].Actions[0].Display; strings.Contains(d, env["DB_PW"]) {
+		t.Fatalf("--var-env value leaked into the command: %q", d)
+	}
+}
+
 func TestUnexpectedDisconnectIsAFailure(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
 	j := loadJob(t, "name: n\nsteps: [{name: s, command: rco-test-drop}, {name: after, command: 'true'}]", nil)

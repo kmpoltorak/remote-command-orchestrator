@@ -29,6 +29,7 @@ type Result struct {
 	ExitCode  *int
 	Truncated bool
 	Bytes     int64
+	Started   bool // the command was started; false if the channel or exec request failed
 
 	stdout, stderr *Buffer
 }
@@ -40,34 +41,68 @@ func (r Result) Found(i int) bool {
 
 // Exec runs one command in a new channel on an existing connection.
 // A non-zero exit status is not an error here; the caller checks ExitCode.
-// Errors are timeouts, cancellation and broken sessions.
+// Errors are timeouts, cancellation and broken sessions. The timeout and ctx
+// cover opening the channel too: if that hangs, the connection is closed.
 func Exec(ctx context.Context, c *ssh.Client, req Request) (Result, error) {
-	sess, err := c.NewSession()
-	if err != nil {
-		return Result{}, domain.Fail(domain.CatSessionFailed, "cannot open session: %v", err)
-	}
-	defer sess.Close()
+	timer := time.NewTimer(req.Timeout)
+	defer timer.Stop()
+	timeout := domain.Fail(domain.CatCommandTimeout, "command did not finish within %s", req.Timeout)
+	cancelled := domain.Fail(domain.CatCancelled, "cancelled")
 	stdout, stderr := NewBuffer(req.MaxOutput, req.Patterns), NewBuffer(req.MaxOutput, req.Patterns)
-	// A nil Stdin would also send EOF; being explicit documents that a command
-	// waiting for input gets EOF instead of hanging until the timeout.
-	sess.Stdin = bytes.NewReader(req.Stdin)
-	sess.Stdout, sess.Stderr = stdout, stderr
-
-	if err := sess.Start(req.Command); err != nil {
-		return Result{}, domain.Fail(domain.CatSessionFailed, "cannot start command: %v", err)
+	type opened struct {
+		sess *ssh.Session
+		err  error
 	}
+	ready := make(chan opened, 1)
+	go func() {
+		sess, err := c.NewSession()
+		if err != nil {
+			ready <- opened{err: domain.Fail(domain.CatSessionFailed, "cannot open session: %v", err)}
+			return
+		}
+		// A nil Stdin would also send EOF; being explicit documents that a command
+		// waiting for input gets EOF instead of hanging until the timeout.
+		sess.Stdin = bytes.NewReader(req.Stdin)
+		sess.Stdout, sess.Stderr = stdout, stderr
+		if err := sess.Start(req.Command); err != nil {
+			_ = sess.Close()
+			ready <- opened{err: domain.Fail(domain.CatSessionFailed, "cannot start command: %v", err)}
+			return
+		}
+		ready <- opened{sess: sess}
+	}()
+	var o opened
+	var fail error
+	select {
+	case o = <-ready:
+	case <-timer.C:
+		fail = timeout
+	case <-ctx.Done():
+		fail = cancelled
+	}
+	if fail != nil {
+		// Only a stuck transport blocks here; closing it is the only way out.
+		_ = c.Close()
+		if o = <-ready; o.sess != nil {
+			_ = o.sess.Close()
+		}
+		return Result{}, fail
+	}
+	if o.err != nil {
+		return Result{}, o.err
+	}
+	sess := o.sess
+	defer sess.Close()
 	done := make(chan error, 1)
 	go func() { done <- sess.Wait() }()
 
-	timer := time.NewTimer(req.Timeout)
-	defer timer.Stop()
-	var fail error
+	var err error
 	select {
 	case err = <-done:
 	case <-timer.C:
-		fail = domain.Fail(domain.CatCommandTimeout, "command did not finish within %s", req.Timeout)
+		fail = timeout
 	case <-ctx.Done():
-		fail = domain.Fail(domain.CatCancelled, "cancelled")
+		fail = cancelled
 	}
 	if fail != nil {
 		_ = sess.Signal(ssh.SIGKILL)
@@ -76,6 +111,7 @@ func Exec(ctx context.Context, c *ssh.Client, req Request) (Result, error) {
 	}
 
 	res := Result{
+		Started:   true,
 		Stdout:    strings.TrimRight(stdout.String(), "\n"),
 		Stderr:    strings.TrimRight(stderr.String(), "\n"),
 		Truncated: stdout.Truncated() || stderr.Truncated(),

@@ -59,6 +59,8 @@ type StepResult struct {
 	Duration  Duration        `json:"duration" yaml:"duration"`
 	Category  domain.Category `json:"failure_category,omitempty" yaml:"failure_category,omitempty"`
 	Reason    string          `json:"failure_reason,omitempty" yaml:"failure_reason,omitempty"`
+
+	started bool // the last attempt's command was started (a lost connection is then expected)
 }
 
 // Duration marshals as a human-readable string ("1.5s").

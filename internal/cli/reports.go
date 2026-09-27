@@ -19,15 +19,15 @@ import (
 // jsonlStream writes one JSON line per host as soon as it finishes, then a
 // final summary line. If rco itself is killed, finished hosts are on disk.
 type jsonlStream struct {
-	path string
-	mu   sync.Mutex
-	f    *os.File
-	err  error
+	mu  sync.Mutex
+	f   *os.File
+	err error
 }
 
 // openStream starts a .jsonl report and hooks it into the runner. Other
-// formats are written at the end and return nil.
-func openStream(path string, o *runner.Options) (*jsonlStream, error) {
+// formats are written at the end and return nil. Call it only right before
+// executing: it truncates an existing file.
+func openStream(path string, r *runner.Runner) (*jsonlStream, error) {
 	if !strings.EqualFold(filepath.Ext(path), ".jsonl") {
 		return nil, nil
 	}
@@ -35,8 +35,8 @@ func openStream(path string, o *runner.Options) (*jsonlStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &jsonlStream{path: path, f: f}
-	o.OnHostDone = func(h runner.HostResult) { s.line(h) }
+	s := &jsonlStream{f: f}
+	r.OnHostDone(func(h runner.HostResult) { s.line(h) })
 	return s, nil
 }
 
@@ -67,14 +67,6 @@ func (s *jsonlStream) close(rep *runner.Report) error {
 		s.err = err
 	}
 	return s.err
-}
-
-// discard removes the file when nothing was run (preview, validation error).
-func (s *jsonlStream) discard() {
-	if s != nil {
-		_ = s.f.Close()
-		_ = os.Remove(s.path)
-	}
 }
 
 // prevHost is the part of a saved report that --only-failed needs.

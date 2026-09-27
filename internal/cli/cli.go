@@ -251,13 +251,8 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	// A preview must work without access to keys and passwords; validate checks them.
 	o.SkipCredentials = !f.execute && !validateOnly
 	o.Progress = 10 * time.Second
-	stream, err := openStream(f.report, &o)
-	if err != nil {
-		return fail("--report: %v", err)
-	}
 	r, err := runner.Prepare(in, o)
 	if err != nil {
-		stream.discard()
 		return fail("validation failed, no host was contacted:\n%v", err)
 	}
 	if validateOnly {
@@ -265,8 +260,11 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 		return ExitOK
 	}
 	if !f.execute {
-		stream.discard()
 		return printPreview(stdout, f.output, r, o.MaxFailures)
+	}
+	stream, err := openStream(f.report, r)
+	if err != nil {
+		return fail("--report: %v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

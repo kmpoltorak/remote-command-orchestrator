@@ -130,12 +130,22 @@ func Prepare(in Input, o Options) (*Runner, error) {
 		}
 		r.Plans = append(r.Plans, p)
 	}
+	// Only now does the redactor know every secret: a --var-env value that is
+	// not declared sensitive still ends up in the rendered command.
+	for _, p := range r.Plans {
+		for i := range p.Actions {
+			p.Actions[i].Display = r.redact.String(p.Actions[i].Display)
+		}
+	}
 	if len(issues) > 0 {
 		// Redact: an env-sourced value may appear in a validation message.
 		return nil, fmt.Errorf("%s", r.redact.String(strings.Join(issues, "\n")))
 	}
 	return r, nil
 }
+
+// OnHostDone sets Options.OnHostDone after Prepare.
+func (r *Runner) OnHostDone(fn func(HostResult)) { r.opts.OnHostDone = fn }
 
 // Run executes all plans. It always returns a complete report; cancelled
 // hosts are reported as CANCELLED.
@@ -275,7 +285,7 @@ func (r *Runner) runHost(ctx context.Context, p Plan) (h HostResult) {
 			sr, f, client = r.runDisconnecting(ctx, client, p, a, sudoPW, log)
 		case a.FireAndForget:
 			sr, f = r.runStep(ctx, client.Client, p, a, sudoPW, log)
-			if f != nil && f.Category != domain.CatCancelled && (f.Category == domain.CatSessionFailed || sr.ExitCode == nil) {
+			if f != nil && sr.started && f.Category != domain.CatCancelled && (f.Category == domain.CatSessionFailed || sr.ExitCode == nil) {
 				f = nil // the command cut the connection while starting: that is fine
 				sr.Status, sr.Category, sr.Reason = domain.StatusSuccess, "", ""
 			}
@@ -323,7 +333,7 @@ func (r *Runner) runDisconnecting(ctx context.Context, c *sshx.Client, p Plan, a
 	stop := sshx.KeepAlive(c.Client, keepaliveInterval, 3)
 	sr, f := r.runStep(ctx, c.Client, p, a, sudoPW, log)
 	stop()
-	lost := f != nil && (f.Category == domain.CatSessionFailed || (f.Category == domain.CatCommandFailed && sr.ExitCode == nil))
+	lost := f != nil && sr.started && (f.Category == domain.CatSessionFailed || (f.Category == domain.CatCommandFailed && sr.ExitCode == nil))
 	if f != nil && !lost {
 		return sr, f, c // a real failure while the connection was fine
 	}
@@ -469,7 +479,7 @@ func (r *Runner) runStep(ctx context.Context, c *ssh.Client, p Plan, a job.Actio
 		sr.Attempts = try + 1
 		var res sshx.Result
 		res, f = r.attempt(ctx, c, p, a, sudoPW)
-		sr.ExitCode = res.ExitCode
+		sr.ExitCode, sr.started = res.ExitCode, res.Started
 		sr.Stdout, sr.Stderr, sr.Truncated = r.mask(a, res.Stdout), r.mask(a, res.Stderr), res.Truncated
 		// Only outcome failures are worth repeating; a dead session or Ctrl+C is not.
 		if f == nil || (f.Category != domain.CatCommandFailed && f.Category != domain.CatCommandTimeout) {
