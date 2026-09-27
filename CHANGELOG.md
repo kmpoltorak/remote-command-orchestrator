@@ -4,6 +4,8 @@ All notable changes to RCO. Versions follow [Semantic Versioning](https://semver
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-27
+
 ### Added
 - Integration tests against a disposable Docker container (`make integration`), run in CI
   as a separate job, plus `shellcheck` and `hadolint`.
@@ -48,6 +50,7 @@ First release: static binaries for Linux (amd64, arm64, armv7) and macOS.
   progress logging for large fleets.
 - One shared connection per bastion for the whole run.
 
-[Unreleased]: https://github.com/kmpoltorak/remote-command-orchestrator/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/kmpoltorak/remote-command-orchestrator/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/kmpoltorak/remote-command-orchestrator/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/kmpoltorak/remote-command-orchestrator/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/kmpoltorak/remote-command-orchestrator/releases/tag/v1.0.0

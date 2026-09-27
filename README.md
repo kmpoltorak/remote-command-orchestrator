@@ -693,7 +693,8 @@ and `rco version` prints it:
 | `rco 9c1d2e3` | no tags yet, commit `9c1d2e3` |
 | `…-dirty` | built with uncommitted changes, so it matches no commit exactly |
 
-To release, tag `main` and push the tag:
+To release, first rename `Unreleased` in [CHANGELOG.md](CHANGELOG.md) to the new
+version in a PR. After it is merged, tag `main` and push the tag:
 
 ```bash
 git tag v1.0.0 && git push origin v1.0.0
