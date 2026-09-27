@@ -481,6 +481,31 @@ steps:
 	}
 }
 
+// A link cut without a TCP reset: the server goes silent but the connection
+// stays open. Keepalives must notice long before the step timeout.
+func TestSilentDropDetectedByKeepalive(t *testing.T) {
+	fastReconnect(t) // keepalive every 200ms, lost after 3 misses
+	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
+	j := loadJob(t, `
+name: silent
+steps:
+  - {name: cut-link, command: rco-test-freeze, disconnect: true, timeout: 5s}
+  - {name: after, command: "echo still-here"}
+`, nil)
+	start := time.Now()
+	rep := runJob(t, context.Background(), Input{Job: j, Targets: []domain.Target{target("h1", srv)}}, opts(sshtest.WriteKnownHosts(t, srv)))
+	h := rep.Hosts[0]
+	if h.Status != domain.StatusSuccess || statuses(h) != "SUCCESS,SUCCESS" || h.Steps[1].Stdout != "still-here" {
+		t.Fatalf("%s %+v", statuses(h), h)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("took %s: the dead session was found by the 5s step timeout, not by keepalives", took)
+	}
+	if !strings.Contains(h.Steps[0].Note, "closed as expected") || srv.Conns.Load() != 2 {
+		t.Fatalf("want one reconnect after the silent drop: note %q, %d connections", h.Steps[0].Note, srv.Conns.Load())
+	}
+}
+
 func TestFireAndForget(t *testing.T) {
 	srv := sshtest.Start(t, sshtest.Options{Password: "login-secret"})
 	j := loadJob(t, `

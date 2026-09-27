@@ -169,7 +169,14 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 	}
 	defer sc.Close()
 	s.Conns.Add(1)
-	go ssh.DiscardRequests(reqs)
+	frozen := new(atomic.Bool) // set by rco-test-freeze
+	go func() {
+		for r := range reqs { // global requests, e.g. keepalive@openssh.com
+			if r.WantReply && !frozen.Load() {
+				_ = r.Reply(false, nil)
+			}
+		}
+	}()
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":
@@ -178,7 +185,7 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 				continue
 			}
 			s.Sessions.Add(1)
-			go s.session(sc, ch, creqs)
+			go s.session(sc, ch, creqs, frozen)
 		case "direct-tcpip":
 			s.forward(nc)
 		default:
@@ -225,12 +232,15 @@ func (s *Server) newBootID() {
 	_ = os.WriteFile(filepath.Join(s.Dir, "boot_id"), fmt.Appendf(nil, "%x\n", id), 0o600)
 }
 
-// session serves one channel. Two magic commands simulate what reboots and
+// session serves one channel. Magic commands simulate what reboots and
 // network restarts do to a real server:
 //
 //	rco-test-drop          the connection dies mid-command (no exit status)
 //	rco-test-reboot DUR    new boot ID, connection dies, no new connections for DUR
-func (s *Server) session(sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Request) {
+//	rco-test-freeze        the connection goes silent without closing (link cut,
+//	                       no TCP reset): no output, no exit status, no keepalive
+//	                       replies. New connections still work.
+func (s *Server) session(sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Request, frozen *atomic.Bool) {
 	defer ch.Close()
 	for req := range reqs {
 		if req.Type == "exec" && s.opts.HangExec {
@@ -246,6 +256,11 @@ func (s *Server) session(sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Re
 		s.mu.Lock()
 		s.commands = append(s.commands, p.Command)
 		s.mu.Unlock()
+		if p.Command == "rco-test-freeze" {
+			frozen.Store(true)
+			_ = sc.Wait() // silent until the client gives up and closes
+			return
+		}
 		if p.Command == "rco-test-drop" {
 			_ = sc.Close()
 			return

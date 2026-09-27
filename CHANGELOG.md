@@ -4,6 +4,11 @@ All notable changes to RCO. Versions follow [Semantic Versioning](https://semver
 
 ## [Unreleased]
 
+### Added
+- Test for silent connection loss: the test SSH server can go silent without closing
+  the connection (`rco-test-freeze`), and `TestSilentDropDetectedByKeepalive` checks that
+  keepalives detect it during a `disconnect` step long before the step timeout.
+
 ### Fixed
 - Flaky "connection refused" tests: they freed a port and expected it to stay closed,
   but a test server in a parallel package could take it. They now use a privileged port.
