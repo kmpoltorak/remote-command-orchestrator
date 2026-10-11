@@ -693,8 +693,7 @@ and `rco version` prints it:
 | `rco 9c1d2e3` | no tags yet, commit `9c1d2e3` |
 | `…-dirty` | built with uncommitted changes, so it matches no commit exactly |
 
-To release, first rename `Unreleased` in [CHANGELOG.md](CHANGELOG.md) to the new
-version in a PR. After it is merged, tag `main` and push the tag:
+To release, tag `main` and push the tag:
 
 ```bash
 git tag v1.0.0 && git push origin v1.0.0
@@ -767,7 +766,7 @@ connection. Secrets never live in files and never appear in output. Every job
 must say how many failed hosts stop the rollout. Commands that cut their own
 connection get simple, explicit flags, not a general mechanism.
 
-**What I changed or rejected in review:** (from [docs/review-log.md](docs/review-log.md))
+**What I changed or rejected in review:**
 - Rejected a full platform (database, REST server, queue, notifications) for a
   Linux-only CLI: it was overkill for the problem.
 - Replaced a general reconnect mechanism with three flags, `reboot`, `disconnect`
@@ -778,9 +777,6 @@ connection get simple, explicit flags, not a general mechanism.
   author must decide how much breakage is acceptable.
 - Removed README claims that no test in the repo backs, as hallucinations
   ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5)).
-- Reversed an earlier "no CHANGELOG" decision and added `CHANGELOG.md`
-  ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5)): users of
-  the binaries need to see what changed between releases.
 
 **What the tests are there to catch:**
 - `copy` writing through a planted symlink as root → `TestIntegrationAlpine` (real
