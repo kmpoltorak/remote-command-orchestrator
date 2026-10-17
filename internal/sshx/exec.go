@@ -107,7 +107,7 @@ func Exec(ctx context.Context, c *ssh.Client, req Request) (Result, error) {
 	if fail != nil {
 		_ = sess.Signal(ssh.SIGKILL)
 		_ = sess.Close()
-		<-done // buffers are quiescent once Wait returns
+		<-done //nolint:errcheck // only wait: buffers are quiescent once Wait returns; the timeout/cancel error wins
 	}
 
 	res := Result{

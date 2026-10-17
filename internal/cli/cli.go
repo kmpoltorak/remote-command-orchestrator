@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -66,7 +67,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	case "validate":
 		return run(args[1:], stdout, stderr, true)
 	case "version", "--version":
-		fmt.Fprintln(stdout, "rco", Version)
+		fmt.Fprintln(stdout, "rco", version(debug.ReadBuildInfo))
 		return ExitOK
 	case "help", "-h", "--help":
 		printHelp(stdout)
@@ -74,6 +75,18 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stderr, "unknown command %q (see rco help)\n", args[0])
 	return ExitError
+}
+
+// version returns Version, or the module version when the binary was built
+// without -ldflags, e.g. by `go install ...@v1.2.3`.
+func version(read func() (*debug.BuildInfo, bool)) string {
+	if Version != "dev" {
+		return Version
+	}
+	if bi, ok := read(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return Version
 }
 
 type multi []string
@@ -266,6 +279,13 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 	if err != nil {
 		return fail("--report: %v", err)
 	}
+	var reportFile *os.File
+	if stream == nil && f.report != "" {
+		// Open now: an unwritable path must fail before any host is touched.
+		if reportFile, err = os.OpenFile(f.report, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err != nil { // reports contain command output
+			return fail("--report: %v", err)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -275,8 +295,8 @@ func run(args []string, stdout, stderr io.Writer, validateOnly bool) int {
 		if err := stream.close(rep); err != nil {
 			fmt.Fprintf(stderr, "error: writing report: %v\n", err)
 		}
-	} else if f.report != "" {
-		if err := writeReport(f.report, rep); err != nil {
+	} else if reportFile != nil {
+		if err := writeReport(reportFile, rep); err != nil {
 			fmt.Fprintf(stderr, "error: writing report: %v\n", err)
 		}
 	}
@@ -313,15 +333,10 @@ func encode(w io.Writer, format string, v any) error {
 	return enc.Encode(v)
 }
 
-func writeReport(path string, rep *runner.Report) error {
+func writeReport(f *os.File, rep *runner.Report) error {
 	format := "json"
-	if ext := strings.ToLower(filepath.Ext(path)); ext == ".yaml" || ext == ".yml" {
+	if ext := strings.ToLower(filepath.Ext(f.Name())); ext == ".yaml" || ext == ".yml" {
 		format = "yaml"
-	}
-	// 0600: reports contain command output.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
 	}
 	if err := encode(f, format, rep); err != nil {
 		_ = f.Close()

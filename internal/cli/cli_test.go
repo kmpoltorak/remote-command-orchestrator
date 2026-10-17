@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -189,6 +190,52 @@ func TestMaxFailuresFromJobAndOverride(t *testing.T) {
 	}
 }
 
+func TestVarOverridesInventoryAndTyposFail(t *testing.T) {
+	f := setup(t)
+	code, stdout, _ := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known,
+		"-H", "web-02", "--var", "color=green", "--verbose")
+	if code != ExitOK || !strings.Contains(stdout, "| color=green") {
+		t.Fatalf("--var must win over the inventory's color=red: %d\n%s", code, stdout)
+	}
+	for _, flag := range []string{"--var", "--var-env"} {
+		code, _, stderr := main(t, "run", "-i", f.inv, "-j", f.job, flag, "colour=RCO_TEST_PW")
+		if code != ExitError || strings.Count(stderr, `declares no variable "colour"`) != 1 {
+			t.Fatalf("an undeclared %s must fail once, not once per host: %d %s", flag, code, stderr)
+		}
+	}
+}
+
+func TestUnwritableReportFailsBeforeConnecting(t *testing.T) {
+	f := setup(t)
+	for _, name := range []string{"r.json", "r.yaml", "r.jsonl"} {
+		rep := filepath.Join(f.dir, "missing-dir", name)
+		code, _, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known, "--report", rep)
+		if code != ExitError || !strings.Contains(stderr, "--report") {
+			t.Fatalf("%s: want exit 1 before the run: %d %s", name, code, stderr)
+		}
+	}
+	if f.srv.Conns.Load() != 0 {
+		t.Fatal("no host may be contacted when the report cannot be written")
+	}
+}
+
+func TestVersionFromBuildInfo(t *testing.T) {
+	info := func(v string) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) { return &debug.BuildInfo{Main: debug.Module{Version: v}}, true }
+	}
+	if got := version(info("v1.2.3")); got != "v1.2.3" {
+		t.Errorf("go install @v1.2.3: got %q", got)
+	}
+	if got := version(info("(devel)")); got != "dev" {
+		t.Errorf("local build: got %q", got)
+	}
+	Version = "v9.9.9"
+	defer func() { Version = "dev" }()
+	if got := version(info("v1.2.3")); got != "v9.9.9" {
+		t.Errorf("-ldflags must win: got %q", got)
+	}
+}
+
 func mustRead(p string) []byte { b, _ := os.ReadFile(p); return b }
 
 func TestJSONLReportAndOnlyFailed(t *testing.T) {
@@ -203,7 +250,7 @@ func TestJSONLReportAndOnlyFailed(t *testing.T) {
 	if len(lines) != 4 || !strings.Contains(lines[3], `"summary"`) {
 		t.Fatalf("want 3 host lines + summary:\n%s", data)
 	}
-	// Rerun only what did not succeed (web-02 still fails: inventory variables win).
+	// Rerun only what did not succeed (web-02 still fails).
 	code, stdout, stderr := main(t, "run", "--execute", "-i", f.inv, "-j", f.job, "--known-hosts", f.known,
 		"--only-failed", rep, "-o", "json", "-q")
 	var r runner.Report
