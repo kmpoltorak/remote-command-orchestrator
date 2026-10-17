@@ -200,8 +200,7 @@ rco run -i prod.yaml -j jobs/x --execute --only-failed run.jsonl
 - Linux-like hosts only.
 - No ssh-agent and no `~/.ssh/config`: everything is in the inventory.
 - No automatic rollback: write jobs that can safely run twice.
-- Not yet tested automatically: a real reboot, and a bastion with many
-  parallel tunnels on a real sshd.
+- Not yet tested: a bastion with many parallel tunnels on a real sshd.
 
 ## Development
 
