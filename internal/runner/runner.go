@@ -90,6 +90,15 @@ func Prepare(in Input, o Options) (*Runner, error) {
 		HostKeys:         &sshx.HostKeys{Path: credentials.ExpandHome(o.KnownHosts), Insecure: o.Insecure, AcceptNew: o.AcceptNewHosts, Logger: o.Logger},
 		Bastions:         &sshx.BastionPool{}, // one connection per bastion for the whole run
 	}
+	// Checked once, not per host: a typo such as --var ntp_sever=x would
+	// otherwise be ignored and the job's default used.
+	for flag, m := range map[string]map[string]string{"--var": in.Vars, "--var-env": in.VarEnv} {
+		for k := range m {
+			if _, ok := in.Job.Variables[k]; !ok {
+				return nil, fmt.Errorf("%s %s: the job declares no variable %q", flag, k, k)
+			}
+		}
+	}
 	auths := map[string]*credentials.Auth{} // one secret lookup per credential
 	resolve := func(c domain.Credential) (*credentials.Auth, error) {
 		if o.SkipCredentials {

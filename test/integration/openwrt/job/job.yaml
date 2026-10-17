@@ -1,0 +1,34 @@
+name: integration-openwrt
+max_failures: 1
+
+variables:
+  wan_ip: {default: 192.0.2.1}
+
+steps:
+  - name: busybox-only
+    command: "! command -v bash && ! command -v sudo"
+
+  - name: copy
+    copy: {src: files/network.tmpl, dest: /etc/config/network, mode: "0600", template: true}
+
+  - name: verify-copy
+    command: stat -c '%a %U' /etc/config/network; cat /etc/config/network; ls -a /etc/config
+    expect:
+      contains: ["600 root", "option ipaddr '192.0.2.1'"]
+      not_contains: ".rco-tmp."   # no temp file left behind
+
+  # Kills this session's dropbear process: the connection drops mid-command.
+  - name: drop-connection
+    command: kill $PPID
+    disconnect: true
+    reconnect_timeout: 30s
+
+  - name: after-reconnect
+    command: echo back
+    expect: {contains: back}
+
+  # Like a SIM switch: the command cuts its own connection, then keeps working
+  # and printing. The test checks /tmp/rco-fired afterwards.
+  - name: fire
+    command: kill $PPID; sleep 1; echo still running; touch /tmp/rco-fired
+    fire_and_forget: true

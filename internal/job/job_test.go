@@ -125,8 +125,8 @@ func TestResolvePrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if vars["iface"] != "host" || vars["site"] != "job-site" || vars["pw"] != "s3cret" {
-		t.Fatalf("precedence: %v", vars)
+	if vars["iface"] != "job" || vars["site"] != "job-site" || vars["pw"] != "s3cret" {
+		t.Fatalf("precedence: --var must win over the inventory: %v", vars)
 	}
 	if len(secrets) == 0 || secrets[0] != "s3cret" {
 		t.Fatalf("secrets: %v", secrets)

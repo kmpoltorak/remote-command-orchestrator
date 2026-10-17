@@ -65,7 +65,7 @@ func CheckValue(v string) error {
 }
 
 // Inputs are the variable sources for one host.
-// Precedence: Host > Job/JobEnv > job file defaults.
+// Precedence: Job/JobEnv > Host > job file defaults.
 type Inputs struct {
 	Host   map[string]string // inventory host/group/defaults variables
 	Job    map[string]string // --var name=value
@@ -83,6 +83,9 @@ func (j *Job) Resolve(in Inputs, lookup func(string) (string, bool)) (map[string
 			vars[name] = *d.Default
 		}
 	}
+	for k, v := range in.Host {
+		vars[k] = v
+	}
 	for k, v := range in.Job {
 		vars[k] = v
 	}
@@ -94,9 +97,6 @@ func (j *Job) Resolve(in Inputs, lookup func(string) (string, bool)) (map[string
 		}
 		vars[k] = v
 		secrets = append(secrets, v)
-	}
-	for k, v := range in.Host {
-		vars[k] = v
 	}
 	for k, v := range vars {
 		if err := CheckValue(v); err != nil {

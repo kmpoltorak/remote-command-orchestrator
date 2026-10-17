@@ -1,808 +1,221 @@
 # RCO — Remote Command Orchestrator
 
-RCO pushes one configuration change over SSH to many Linux hosts in parallel,
-verifies every step, and reports exactly what happened where.
-
-## Problem
-
-A change has to reach many small Linux devices, such as LTE routers at remote
-sites, and you need to know which ones actually got it. The links are
-unreliable: connections drop silently, one slow site holds up the rest, and
-some changes cut their own uplink (SIM switch, network restart, reboot). The
-devices often have no Python, only a POSIX shell.
-
-You describe the change once in a **job file** (commands, bash scripts and file
-uploads). RCO runs it on every selected host:
-
-- Single static binary with no agent on the hosts. It uses pure Go SSH and never calls an `ssh` binary.
-- Login with an SSH key (optionally passphrase-protected) or a username and password.
-- `sudo` per step, including hosts that require a sudo password.
-- Upload files, optionally rendered from a template per host, and replace them atomically.
-- Host keys are verified against `known_hosts` by default.
-- Every host is validated before any host is contacted, so a typo never leaves you with a half-applied change.
-- Safe by default: `rco run` only previews what it would do. Nothing touches a host without `--execute`.
-- Parallel with a hard limit (`--concurrency`). Ctrl+C cancels cleanly.
-- Output as a table, JSON or YAML, plus an optional report file. Secrets are masked everywhere.
-
-## Why not Ansible?
-
-Ansible is the right tool for most configuration management. RCO exists for
-one case where it gets painful: pushing a change to many small devices over
-unreliable links, such as LTE routers at remote sites.
-
-| At fleet scale | Ansible, by default | RCO |
-|---|---|---|
-| Connection drops silently (no TCP reset) | The task can hang until an outer timeout, or indefinitely, unless you add SSH keepalives and a task `timeout` | Every step has a timeout (default 5m) that also covers opening the SSH session; during `reboot`/`disconnect` steps keepalives every 5 s detect a dead session in about 15 s |
-| One slow host | `linear` strategy: each task waits for the slowest host before the next one starts | Each host runs its steps independently, capped by `--concurrency` |
-| Parallelism | `forks: 5`, one controller process per connection | `--concurrency 100`, one goroutine per host inside a single static binary |
-| Python on the target | Needed by most modules; OpenWrt and RutOS don't ship it, so only `raw` is left | Needs only a POSIX shell and basic tools (`mktemp`, `cp`, `mv`…); `bash` only for `script:` steps |
-| Commands that cut the uplink (SIM switch, network restart) | `async` / `poll: 0`, handled task by task | `fire_and_forget`, `disconnect`, and `reboot` with a boot-ID check |
-| Stopping a bad rollout | `max_fail_percentage`, optional | `max_failures`, required in every job |
-
-Most of this can be tuned in Ansible (the `free` strategy, more forks, SSH
-keepalives, Mitogen). RCO makes it the default and drops the Python dependency.
-
-Reported hangs and drops: ansible/ansible
-[#30411](https://github.com/ansible/ansible/issues/30411),
-[#18305](https://github.com/ansible/ansible/issues/18305),
-[#69854](https://github.com/ansible/ansible/issues/69854),
-[#20100](https://github.com/ansible/ansible/issues/20100),
-[#77325](https://github.com/ansible/ansible/issues/77325).
+RCO runs one change (commands, scripts, file uploads) over SSH on many Linux
+hosts in parallel and reports the result for each host. It is built for small
+devices on unreliable links, such as LTE routers: it needs only a POSIX shell
+on the host, no agent and no Python.
 
 ```text
-$ rco run --inventory hosts.yaml --job jobs/configure-ntp --group web --var ntp_server=ntp1.example.com --execute
+$ rco run -i hosts.yaml -j jobs/configure-ntp -g web --execute
 HOST     STATUS   FAILED STEP  REASON                                   DURATION
 web-01   SUCCESS  -            -                                        2.41s
-web-02   SUCCESS  -            -                                        2.37s
-web-03   FAILED   verify       output does not contain "ntp1.example"   2.52s
+web-02   FAILED   verify       output does not contain "ntp1.example"   2.52s
 
-3 hosts: 2 succeeded, 1 failed, 0 cancelled in 2.53s (job configure-ntp, sha256 4be1c07e93aa)
+2 hosts: 1 succeeded, 1 failed, 0 cancelled in 2.53s (job configure-ntp, sha256 4be1c07e93aa)
 ```
 
-## Quick start
+Safety rules:
 
-### Install
+- `rco run` only previews. Nothing runs on a host without `--execute`.
+- All hosts are validated (variables, templates, credentials) before any is contacted.
+- Host keys are checked against `known_hosts`. Secrets never live in files and are masked in output.
+- Every job sets `max_failures`: after that many failed hosts, no new host starts.
 
-Download a binary from
-[Releases](https://github.com/kmpoltorak/remote-command-orchestrator/releases)
-for Linux (amd64, arm64, armv7) or macOS (Intel, Apple Silicon). The binary is
-static and has no dependencies:
+## Install
 
-```bash
-gh release download --repo kmpoltorak/remote-command-orchestrator --pattern '*darwin_arm64.tar.gz'
-tar -xzf rco_*_darwin_arm64.tar.gz && sudo mv rco_*/rco /usr/local/bin/
-rco version
-```
-
-Or build it yourself:
+Download a binary for Linux (amd64, arm64, armv7) or macOS from
+[Releases](https://github.com/kmpoltorak/remote-command-orchestrator/releases), or:
 
 ```bash
 go install github.com/kmpoltorak/remote-command-orchestrator/cmd/rco@latest
-# or from a checkout:
-make build        # -> bin/rco
 ```
 
-Requires Go 1.27+ to build. Target hosts need `sh`, `bash` (for `script` steps),
-`mktemp`, `dirname`, `cp`, `chmod` and `mv`, which every mainstream Linux distribution has, plus
-`sudo` if steps use it.
+Hosts need `sh`, `mktemp`, `dirname`, `cp`, `chmod` and `mv` (busybox is
+enough), plus `bash` for `script:` steps and `sudo` for `sudo:` steps.
 
-### First run
+## Quick start
 
-1. Describe your hosts (`hosts.yaml`):
+`hosts.yaml`:
 
 ```yaml
 credentials:
-  deploy-key:
-    type: private_key
-    username: deploy
-    key_file: ~/.ssh/deploy_ed25519
-
+  deploy-key: {type: private_key, username: deploy, key_file: ~/.ssh/deploy_ed25519}
 defaults:
   credential: deploy-key
-
 groups:
   web:
     hosts:
-      - name: web-01
-        address: 192.0.2.10
-      - name: web-02
-        address: 192.0.2.11
+      - {name: web-01, address: 192.0.2.10}
+      - {name: web-02, address: 192.0.2.11}
 ```
 
-2. Describe the change in its own folder (`jobs/uptime/job.yaml`):
+`jobs/uptime/job.yaml`:
 
 ```yaml
 name: uptime
-max_failures: "100%"   # read-only, never stop (required field, see below)
+max_failures: "100%"
 steps:
   - name: uptime
     command: uptime
 ```
 
-3. Check it, preview it, run it:
-
 ```bash
-rco validate --job jobs/uptime --inventory hosts.yaml
-rco run --inventory hosts.yaml --job jobs/uptime                       # preview only
-rco run --inventory hosts.yaml --job jobs/uptime --execute --verbose   # apply
+rco validate -j jobs/uptime -i hosts.yaml              # check, no connections
+rco run -i hosts.yaml -j jobs/uptime                   # preview
+rco run -i hosts.yaml -j jobs/uptime --execute -v      # run, show output
 ```
 
-The hosts must be in `~/.ssh/known_hosts` (see [Host keys](#host-keys)).
+Hosts must already be in `~/.ssh/known_hosts`, or pass `--accept-new-host-keys`
+to add unknown ones (changed keys are still rejected). More examples are in
+[`examples/`](examples/).
 
-## Job files
+## Job file
 
-### Organizing jobs
-
-RCO imposes no layout. `--job` accepts a directory (it loads `job.yaml` from
-it) or a path to any YAML file. Paths in `script:` and `copy.src` are relative
-to the job file, so it works wherever the job lives.
-
-We recommend one folder per job: `job.yaml` plus the scripts and files it uses.
-Nothing gets mixed up between jobs, and a job folder can be moved or copied as a
-unit:
-
-```text
-jobs/
-├── configure-ntp/
-│   ├── job.yaml
-│   ├── files/chrony.conf.tmpl
-│   └── scripts/restart-chrony.sh
-├── create-db-user/
-│   └── job.yaml
-└── system-info/
-    └── job.yaml
-```
-
-`examples/jobs/` uses this layout. For real use, keep your jobs and inventories
-in a separate repository of their own, so every change to your fleet's
-configuration is versioned and reviewable. It contains no secrets, only
-references to them (see [Secrets](#secrets)).
-
-### Steps
-
-A job is an ordered list of steps. On each host, all steps run over **one SSH
-connection**, in order. A failing step stops that host unless the step sets
-`continue_on_error: true`. The remaining steps are reported as `SKIPPED`.
+`-j` takes a job directory (with `job.yaml`) or a YAML file. Steps run in
+order on each host over one connection. A failed step stops that host.
 
 ```yaml
-name: configure-ntp            # required
-description: Install chrony and push its config
-version: "1.2"                 # free text, shown in reports
-max_failures: "5%"             # required: stop starting hosts after 5% failed
-
+name: configure-ntp
+max_failures: "5%"             # required: number of hosts ("5") or share ("5%")
 variables:
-  ntp_server:
-    required: true
-  ntp_pool:
-    default: pool.ntp.org
-
-defaults:                      # apply to every step unless the step overrides them
+  ntp_server: {required: true}
+defaults:                      # apply to every step
   timeout: 60s
-  retries: 0
-  retry_delay: 2s
   sudo: true
-
 steps:
-  - name: install-chrony
-    command: DEBIAN_FRONTEND=noninteractive apt-get install -y chrony
-    timeout: 5m
+  - name: install
+    command: apt-get install -y chrony
     retries: 2
-
-  - name: upload-config
-    copy:
-      src: files/chrony.conf.tmpl        # relative to job.yaml
-      dest: /etc/chrony/chrony.conf
-      mode: "0644"                       # default 0644
-      template: true                     # render {{ .var }} inside the file
-
+  - name: config
+    copy: {src: files/chrony.conf.tmpl, dest: /etc/chrony/chrony.conf, mode: "0644", template: true}
   - name: restart
-    script: scripts/restart-chrony.sh    # local file, runs with bash on the host
-
+    script: scripts/restart-chrony.sh     # runs with bash; variables exported as $ntp_server
   - name: verify
     sudo: false
     command: chronyc -n sources
-    expect:
-      contains: "{{ .ntp_server }}"
-      not_contains: "503 No such source"
+    expect: {contains: "{{ .ntp_server }}"}
 ```
 
-`max_failures` is required in every job. Once this many hosts have failed
-(`"5"`) or this share of the selected hosts (`"5%"`), no new host is started.
-Hosts already running finish, and the rest are reported as `SKIPPED`. Whoever
-writes the job decides how much breakage is acceptable: `1` for a risky
-database change, `"100%"` (never stop) for read-only fact gathering.
-`--max-failures` on the command line overrides it for one run.
+Each step has one of `command`, `script` or `copy`. `copy` writes a temp file
+next to `dest` and renames it, so readers never see a partial file. Paths are
+relative to the job file.
 
-### Step types
-
-Each step has exactly one of these:
-
-| Field | What happens on the host |
+| Step option | Meaning |
 |---|---|
-| `command: <text>` | Runs through the login shell, as with `ssh host '<text>'`. |
-| `script: <file>` | The local file is uploaded to a private temp file (0600) and run with `bash`, then deleted. Job variables are exported at the top of the script (`$ntp_server`). |
-| `copy: {src, dest, mode, template}` | The local file is uploaded, copied to a new temp file (`mktemp`) next to `dest`, given `mode`, then renamed over `dest`. Readers never see a half-written file. With `sudo: true` the file ends up owned by root. |
+| `sudo` | run as root |
+| `timeout` | kill the command after this long (default 5m) |
+| `retries`, `retry_delay` | re-run a failed step |
+| `continue_on_error` | keep going; the host is still reported as failed |
+| `expect` | `exit_code` (default 0), `contains`, `not_contains`, `regex` |
+| `sensitive` | hide the command and output |
+| `reboot` | the command reboots the host; wait until it is back with a new boot ID |
+| `disconnect` | the command may drop the connection (network restart); reconnect and continue |
+| `reconnect_timeout` | how long to wait after `reboot` (default 10m) or `disconnect` (default 5m) |
+| `fire_and_forget` | start the command in the background and check nothing (e.g. a SIM switch); last step only |
 
-### Step options
+`reboot`, `disconnect` and `fire_and_forget` steps never retry, so the command
+never runs twice.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `sudo` | `defaults.sudo` | Run the step as root through sudo. |
-| `timeout` | `defaults.timeout`, else `--timeout` (5m) | The command is killed when this is exceeded (`COMMAND_TIMEOUT`). The limit also covers opening the SSH session; if that hangs, the connection is closed. |
-| `retries` / `retry_delay` | `defaults.retries` (0) / 2s | Re-run the step if it fails or times out. Never applies to `reboot`, `disconnect` or `fire_and_forget` steps. |
-| `continue_on_error` | `false` | Record the failure but keep going. The host is still reported as `FAILED`. |
-| `sensitive` | `false` | Mask the command and output in all output (`[SENSITIVE]`). The command is also sent as a temp file, so it never shows up in the remote process list. |
-| `expect` | exit code 0 | See below. |
-| `reboot` | `false` | The command reboots the host. See [Reboots, connection loss and fire-and-forget](#reboots-connection-loss-and-fire-and-forget). |
-| `disconnect` | `false` | The command may drop the SSH connection, e.g. a network or sshd restart. |
-| `reconnect_timeout` | 10m (reboot), 5m (disconnect) | How long to wait for the host to be reachable again. |
-| `fire_and_forget` | `false` | Start the command and stop there. Nothing is checked, and the connection may drop. Must be the last step. |
-
-### Expectations
-
-All conditions must hold:
-
-```yaml
-expect:
-  exit_code: 0                  # default 0
-  contains: "active (running)"  # string or list; every entry must appear
-  not_contains: [ERROR, FATAL]  # none may appear
-  regex: 'version \d+\.\d+'     # RE2 regex matched against stdout
-```
-
-`contains` and `not_contains` search stdout and stderr, including any part
-dropped by the output limit.
-
-### Reboots, connection loss and fire-and-forget
-
-Some commands cut their own SSH connection: `reboot`, a network restart, an
-sshd restart. For a normal step that is a failure. Mark such steps so it is
-expected instead:
-
-```yaml
-steps:
-  - name: reboot
-    command: systemctl reboot
-    reboot: true               # wait until the host is back after the reboot
-    reconnect_timeout: 10m
-
-  - name: restart-network
-    command: systemctl restart systemd-networkd
-    disconnect: true           # the connection may drop; reconnect and continue
-
-  - name: verify
-    command: uname -r          # runs on the fresh connection
-```
-
-- **`reboot: true`**: before the command, RCO records the host's boot ID
-  (`/proc/sys/kernel/random/boot_id`). A dropped connection counts as success.
-  RCO then reconnects every 5 seconds until the host answers with a **new**
-  boot ID. The host that is still shutting down is never mistaken for one that is
-  back. The step fails if that does not happen within `reconnect_timeout`.
-- **`disconnect: true`**: a dropped connection counts as success, and RCO
-  reconnects before the next step. If the connection survived, it simply
-  continues.
-- During these steps SSH keepalives run every 5 seconds. A connection that
-  silently hangs, with no TCP reset, is detected after about 15 seconds
-  instead of waiting for the step timeout.
-- Authentication and host key errors while reconnecting end the wait
-  immediately: they don't fix themselves, and a changed host key must never be
-  retried.
-- A real failure while the connection is alive, such as a non-zero exit code or an
-  unmet expectation, is still a failure. So is a command the host refused to
-  start. `retries` cannot be combined with these options, and `defaults.retries`
-  does not apply to them, because the command must not run twice.
-- The report shows a `note` such as `host rebooted (new boot ID) and was back after 48s`.
-
-`examples/jobs/kernel-update` upgrades packages, reboots and verifies the host.
-
-**Fire and forget.** Some commands should just be started, with no waiting
-and no checking, for example switching the SIM card on a router, which kills
-the uplink the SSH session runs over:
-
-```yaml
-steps:
-  - name: switch-sim
-    command: gsmctl -Y
-    fire_and_forget: true
-```
-
-RCO starts the command in the background, detached from the SSH session
-(it ignores SIGHUP and has no terminal), so it keeps running when the
-connection drops. The step succeeds as soon as the command has started (if the
-session cannot be opened or the host refuses to run it, the step fails), and
-the command's exit code and output are never looked at. Because the connection
-may be gone afterwards, a `fire_and_forget` step must be the last step, and it
-cannot be combined with `reboot`, `disconnect`, `retries`, `sensitive` or
-`expect`.
-
-### OpenWrt and other minimal systems
-
-RCO needs only a POSIX shell and the basic tools listed under
-[Install](#install), which busybox provides. On OpenWrt:
-
-- Log in as `root` and don't use `sudo`, which isn't installed.
-- Use `command:` steps. `script:` steps run with `bash`, which OpenWrt doesn't ship.
-- `copy:` works: it needs only `mktemp`, `dirname`, `cp`, `chmod` and `mv`.
-
-`examples/jobs/openwrt-sim-switch` switches the SIM on Teltonika RutOS routers,
-with `examples/inventories/prod/routers.yaml`.
+**OpenWrt:** log in as `root`, don't use `sudo`, and use `command:` and `copy:`
+(`script:` needs bash). See `examples/jobs/openwrt-sim-switch`.
 
 ### Variables
 
-Templates use one form only: `{{ .name }}`. There are no functions, pipes or
-logic, so a job file cannot execute code on your machine. Variables work in
-`command`, `copy.dest`, `expect.contains`/`not_contains` and, with
-`template: true`, inside uploaded files. Values may not contain newlines or
-other control characters, so a variable can't inject an extra command.
+Write `{{ .name }}` in `command`, `copy.dest`, `expect` and templated files.
+Values come from, highest priority first:
 
-Precedence (highest first):
+1. `--var name=value` or `--var-env name=ENV_VAR`
+2. inventory `variables` (host, then group, then inventory defaults)
+3. `default:` in the job
 
-1. Inventory variables: host, then group defaults, then inventory defaults.
-2. Command line: `--var name=value` / `--var-env name=ENV_VAR`.
-3. `default:` in the job file.
+A `--var` the job doesn't declare is an error. Values are inserted into shell
+commands as they are, so only use trusted values.
 
-Variables are inserted into shell commands as-is, so treat inventory and `--var`
-values as trusted input.
-
-### Secrets
-
-Mark a variable `sensitive: true` and pass it **only** through the environment:
-
-```yaml
-variables:
-  db_password:
-    required: true
-    sensitive: true
-steps:
-  - name: create-user
-    sensitive: true            # required when a step uses a sensitive variable
-    command: runuser -u postgres -- psql -c "ALTER ROLE app PASSWORD '{{ .db_password }}'"
-```
-
-```bash
-DB_PASSWORD=... rco run ... --var-env db_password=DB_PASSWORD --execute
-```
-
-RCO refuses sensitive values given with `--var` or in the inventory, and refuses
-a non-sensitive step that uses a sensitive variable. The values of every
-secret are replaced with `[REDACTED]` wherever they would appear in output,
-reports or errors, including the rendered commands in the preview and reports.
-This covers passwords, key passphrases, sudo passwords and `--var-env` values,
-even for variables not declared `sensitive`.
+**Secrets:** declare the variable `sensitive: true`, pass it with `--var-env`,
+and mark every step that uses it `sensitive: true`. RCO replaces passwords,
+passphrases and `--var-env` values with `[REDACTED]` everywhere.
 
 ## Inventory
 
 ```yaml
-credentials:                     # references only: RCO never stores secrets
+credentials:                       # only references; secrets come from the environment
   deploy-key:
     type: private_key
     username: deploy
     key_file: ~/.ssh/deploy_ed25519
-    passphrase_env: DEPLOY_KEY_PASSPHRASE   # only for encrypted keys
-    sudo_password_env: DEPLOY_SUDO_PASSWORD # omit for NOPASSWD sudo
+    passphrase_env: DEPLOY_KEY_PASSPHRASE   # encrypted key only
+    sudo_password_env: DEPLOY_SUDO_PASSWORD # omit for passwordless sudo
   legacy:
     type: password
     username: admin
     password_env: LEGACY_PASSWORD           # also used for sudo
-
 bastions:
-  corp-bastion:
-    address: bastion.example.com
-    port: 22
-    credential: deploy-key
-
-defaults:                        # inherited by every host
-  port: 22
+  jump: {address: bastion.example.com, credential: deploy-key}
+defaults:
   credential: deploy-key
-  variables: {ntp_pool: pool.ntp.org}
-
 groups:
   web:
-    defaults:                    # inherited by hosts in this group
-      tags: [production]
-      variables: {ntp_server: ntp1.example.com}
+    defaults: {variables: {ntp_server: ntp1.example.com}}
     hosts:
-      - name: web-01
-        address: 192.0.2.10
-      - name: web-02
-        address: 192.0.2.11
-        port: 2222
-        tags: [canary]
+      - {name: web-01, address: 192.0.2.10, tags: [canary]}
+      - {name: web-02, address: 192.0.2.11, port: 2222}
   internal:
-    defaults:
-      bastion: corp-bastion
+    defaults: {bastion: jump}
     hosts:
-      - name: db-01
-        address: 198.51.100.5
-
-hosts:                           # hosts outside any group
-  - name: old-app-01
-    address: 203.0.113.5
-    credential: legacy
+      - {name: db-01, address: 198.51.100.5}
 ```
 
-A host setting wins over group defaults, and group defaults win over inventory
-defaults. `username` falls back to the credential's username. Unknown fields
-are errors, so typos are caught.
-
-### Selecting hosts
-
-```bash
---group web --group db      # hosts in web OR db
---tag canary                # hosts tagged canary
---host web-01 --host db-01  # explicit hosts
---group web --tag canary    # AND across kinds: canary hosts in web
--g web -t canary            # same, with short flags
-```
-
-With no selectors, every host is selected. Unknown groups or hosts are errors.
-
-### Environments
-
-Recommended: split **inventories** by environment and keep **jobs** shared.
-
-```text
-inventories/
-├── test/hosts.yaml
-├── dev/hosts.yaml
-└── prod/hosts.yaml
-jobs/
-└── configure-ntp/job.yaml      # one job for every environment
-```
-
-```bash
-rco run --inventory inventories/test/hosts.yaml --job jobs/configure-ntp --execute
-rco run --inventory inventories/prod/hosts.yaml --job jobs/configure-ntp --execute
-```
-
-- **Inventories per environment.** Environments are different hosts with
-  different credentials and values. Touching prod always means typing a `prod/`
-  path on purpose. `examples/inventories/` uses this layout.
-- **Jobs are not split.** A job says *what* to do, and the inventory says *where*
-  and *with which values*. Differences between environments (another NTP server,
-  another database user) belong in the inventory's `variables`. Copies of a job
-  in `jobs/test/` and `jobs/prod/` would drift apart, and prod would run
-  something other than what was tested. The `hash` in the report shows that test
-  and prod ran exactly the same job.
-- Shared settings can live in a separate file. Repeat `-i` to combine files:
-  `-i inventories/common.yaml -i inventories/prod/hosts.yaml`. Credentials,
-  bastions, groups and hosts from all files are merged. A name defined in two
-  files is an error, never a silent override, and `defaults` may be set in one file only.
-- Use tags **within** an environment to pick a subset, such as `--tag canary`.
-  Keeping environments as groups or tags in one file also works, but a forgotten
-  selector then selects every host, prod included.
-
-## Authentication and sudo
-
-- **Key**: `type: private_key` with `key_file`. Encrypted keys need `passphrase_env`.
-- **Password**: `type: password` with `password_env`. Keyboard-interactive is answered too.
-- Plaintext passwords are not accepted in any file.
-
-For `sudo: true` steps, RCO first checks once per host whether sudo works
-without a password (`sudo -n true`):
-
-- **NOPASSWD**: steps run with `sudo -n`, and no password is ever sent.
-- **Password required**: steps run with `sudo -k -S`, and the password is written to
-  the command's stdin. The password comes from `sudo_password_env`, or from the
-  login password for `type: password`. `-k` makes sudo always read it, so it can
-  never fall through to the command.
-
-Script and file content never travels on the same stdin as the sudo password.
-It is uploaded to a temp file first.
-
-## Host keys
-
-Host keys are checked against `~/.ssh/known_hosts` (`--known-hosts FILE`). An
-unknown host fails with `HOST_KEY_UNKNOWN`, and a changed key fails with
-`HOST_KEY_MISMATCH`. Neither is ever retried. Servers usually have several key
-types (ed25519, ecdsa, rsa). Like OpenSSH, RCO negotiates a type that
-`known_hosts` already holds for the host, so one entry per host is enough.
-
-To trust a new host, either verify its fingerprint out of band and add it:
-
-```bash
-ssh-keyscan -p 22 192.0.2.10 >> ~/.ssh/known_hosts
-```
-
-or let RCO add it on first contact with `--accept-new-host-keys`. This works
-like OpenSSH's `StrictHostKeyChecking=accept-new`: a host that has no entry yet
-is added (the fingerprint is logged), while a host whose key **changed** is
-still rejected with `HOST_KEY_MISMATCH`. The known_hosts file and its directory
-are created if missing, so a dedicated file works out of the box:
-
-```bash
-rco run ... --known-hosts ~/rco/known_hosts --accept-new-host-keys --execute
-```
-
-`--insecure-skip-host-key-check` disables verification for lab use and logs a
-warning. Never use it on networks you don't control.
+Host settings override group defaults, which override inventory defaults.
+Select hosts with `-g GROUP`, `-t TAG` and `-H HOST` (repeatable; OR within a
+kind, AND across kinds; none selects all). Keep one inventory per environment
+and combine shared files with repeated `-i`.
 
 ## Running
 
-```text
-rco run      -i INVENTORY -j JOB [selectors] [options]              preview only
-rco run      -i INVENTORY -j JOB [selectors] [options] --execute    apply changes
-rco validate -j JOB [-i INVENTORY [selectors]]                      check without connecting
+Run `rco help` for every option. The ones you'll use most:
 
-  -i, --inventory FILE                inventory FILE; repeat to combine files (e.g. common.yaml + prod.yaml)
-  -j, --job JOB                       JOB directory (with job.yaml) or job YAML file
-  -g, --group NAME                    select hosts in group NAME (repeatable)
-  -t, --tag NAME                      select hosts with tag NAME (repeatable)
-  -H, --host NAME                     select host NAME (repeatable)
-      --execute                       actually run the job; without it RCO only previews, connecting to nothing
-      --var NAME=VALUE                job variable NAME=VALUE (repeatable)
-      --var-env NAME=ENV_VAR          job variable NAME=ENV_VAR read from the environment; required for sensitive variables (repeatable)
-  -c, --concurrency N                 maximum hosts processed at the same time (default 100)
-      --max-failures N                override the job's max_failures: stop starting new hosts after N failed hosts, or N% of all hosts; the rest are SKIPPED
-      --only-failed REPORT            run only on hosts that did not succeed in a previous REPORT (.json, .yaml or .jsonl)
-      --timeout DURATION              default per-step timeout (job file values win) (default 5m0s)
-      --connect-timeout DURATION      TCP connect timeout (default 10s)
-      --handshake-timeout DURATION    SSH handshake and authentication timeout (default 15s)
-      --connect-retries N             extra connection attempts for transient failures (never for auth or host key errors) (default 2)
-      --retry-delay DURATION          base delay between retries (exponential with jitter) (default 2s)
-      --max-retry-delay DURATION      maximum delay between connection retries (default 30s)
-      --max-output BYTES              BYTES of stdout/stderr kept per step (head and tail are kept) (default 1048576)
-      --known-hosts FILE              known_hosts FILE used to verify host keys (default ~/.ssh/known_hosts)
-      --accept-new-host-keys          add keys of hosts missing from known_hosts (trust on first use); changed keys still fail
-      --insecure-skip-host-key-check  INSECURE: do not verify host keys (lab use only)
-  -o, --output FORMAT                 result FORMAT on stdout: table, json or yaml (default table)
-      --report FILE                   also write the full report to FILE (.json, .yaml; .jsonl is written host by host as results arrive)
-  -v, --verbose                       table output: include every step with its output
-  -q, --quiet                         log only warnings and errors (hides progress)
-```
+| Option | Meaning |
+|---|---|
+| `--execute` | actually run (otherwise preview) |
+| `-c N` | hosts at the same time (default 100) |
+| `-o json\|yaml` | machine-readable output on stdout; logs go to stderr |
+| `--report FILE` | save the report (`.json`, `.yaml`, or `.jsonl` written host by host) |
+| `--only-failed REPORT` | rerun only the hosts that did not succeed |
+| `--max-failures N` | override the job's `max_failures` |
 
-- Every flag also works with a single dash (`-execute`). `--execute` has no
-  short form on purpose: applying changes is always typed out in full.
-- **Preview is the default.** Without `--execute`, `rco run` validates everything
-  and prints the steps per host (or JSON/YAML with `--output`) without connecting
-  or reading any key or password.
-- **stdout** carries results only and **stderr** carries logs, so `rco run ... --execute --output json | jq` works.
-- **Exit codes**: `0` means every host succeeded, `2` means the run finished but some host
-  failed, was skipped (`max_failures`) or cancelled, and `1` means a usage, validation or file error, in which case no host was contacted.
-- **Connection retries** apply only to transient errors: timeouts, refused
-  connections, broken handshakes. Authentication, host key and DNS errors fail
-  immediately.
-- **Output limit**: when a step prints more than `--max-output`, the first
-  and last halves are kept with a `...[truncated N bytes]...` marker.
-- **Ctrl+C** stops starting new hosts, kills running commands, and still
-  prints and writes the report. Unfinished hosts are `CANCELLED`.
+Exit codes: `0` all hosts succeeded, `1` invalid input (no host contacted),
+`2` some host failed, was skipped or was cancelled. Ctrl+C starts no new hosts,
+cancels the running ones and still writes the report.
 
-`rco validate --job JOB [--inventory FILE ...]` checks the job and, when
-an inventory is given, variables and credentials for every selected host,
-without connecting.
-
-### Report
-
-`--output json|yaml` and `--report FILE` produce the same document:
-
-```json
-{
-  "job": "configure-ntp", "version": "1.2", "hash": "4be1c07e…",
-  "started_at": "2026-09-25T08:00:00Z", "finished_at": "…", "duration": "2.53s",
-  "summary": {"total": 3, "success": 2, "failed": 1, "cancelled": 0},
-  "hosts": [{
-    "host": "web-03", "address": "192.0.2.12:22", "status": "FAILED",
-    "failed_step": "verify", "failure_category": "COMMAND_FAILED",
-    "failure_reason": "output does not contain \"ntp1.example.com\"",
-    "connect_attempts": 1, "duration": "2.52s",
-    "steps": [{"name": "install-chrony", "kind": "command", "command": "…",
-               "status": "SUCCESS", "attempts": 1, "exit_code": 0,
-               "stdout": "…", "duration": "1.8s"}]
-  }]
-}
-```
-
-`hash` is the SHA-256 of the job file plus every script and uploaded file, so a
-report identifies exactly what ran. Report files are created with mode 0600 and
-written only with `--execute`; a preview leaves an existing report untouched.
-
-With a `.jsonl` file name, `--report` writes one JSON line per host **as soon
-as the host finishes**, then a final line with the summary. If RCO itself is
-killed halfway, the finished hosts are already on disk.
-
-Failure categories: `CONNECTION_TIMEOUT`, `CONNECTION_REFUSED`, `DNS_FAILURE`,
-`AUTH_FAILED`, `HOST_KEY_MISMATCH`, `HOST_KEY_UNKNOWN`, `SSH_HANDSHAKE_FAILED`,
-`SESSION_FAILED`, `COMMAND_TIMEOUT`, `COMMAND_FAILED`, `TEMPLATE_ERROR`,
-`CANCELLED`, `INTERNAL_ERROR`.
-
-## Large fleets
-
-RCO handles thousands of hosts in one run. The hosts form a queue:
-`--concurrency` of them (default 100) run at once, and each finished host
-frees its slot for the next one. Nothing is started early and nothing is
-dropped. Only hosts that currently hold a slot have an open connection.
+A typical rollout:
 
 ```bash
-# 1. canaries first
-rco run -i prod/hosts.yaml -j jobs/x -t canary --execute
-# 2. everything (the job's max_failures applies), stream the report
-rco run -i prod/hosts.yaml -j jobs/x --execute -c 300 --report run.jsonl
-# 3. after fixing the cause: only the hosts that did not succeed
-rco run -i prod/hosts.yaml -j jobs/x --execute --only-failed run.jsonl --report run2.jsonl
+rco run -i prod.yaml -j jobs/x -t canary --execute
+rco run -i prod.yaml -j jobs/x --execute --report run.jsonl
+rco run -i prod.yaml -j jobs/x --execute --only-failed run.jsonl
 ```
 
-- **`max_failures`** (required in every job, `--max-failures` overrides it):
-  once that many hosts have failed, no new hosts are started. A broken job then
-  stops after a handful of hosts instead of hitting all 30 000.
-- **`--only-failed REPORT`** reruns only the hosts that were not `SUCCESS` in a
-  previous `.json`, `.yaml` or `.jsonl` report. Selectors still apply.
-- **Progress**: every 10 seconds RCO logs `done`, `total`, `running`, `failed`
-  and an `eta` to stderr. Each finished host is logged too. `-q` hides both.
-- **Duration** is roughly `hosts / concurrency × time per host`. For example,
-  15 000 hosts at 5 s each take about 12.5 minutes with `-c 100` and about 4 minutes with `-c 300`.
-- **Memory**: results are kept until the end of the run. With short command
-  output that is a few KB per host. For chatty commands, lower `--max-output`
-  (for example `16384`).
-- **Bastions**: RCO logs in to each bastion **once** per run and tunnels every
-  host through that one connection. Hosts that ask for the bastion at the same
-  time wait for the same login. The bastion therefore never sees a storm of
-  logins, and OpenSSH's `MaxStartups` limit doesn't apply. A lost bastion
-  connection is re-established on the next host.
-- **Inventory size**: up to 64 MiB per file, and files can be split and
-  combined with repeated `-i`.
+## Limitations
 
-## How it works
-
-```mermaid
-flowchart LR
-    A[job + inventory] --> B[validate every host:<br/>variables, templates, secrets]
-    B -->|any error| X[exit 1, nothing contacted]
-    B -->|no --execute| P[print preview, exit 0]
-    B -->|--execute| C[up to --concurrency hosts in parallel]
-    C --> D[SSH connect<br/>direct or via bastion,<br/>known_hosts check]
-    D --> E[steps in order,<br/>one channel each]
-    E --> F[report: stdout / file]
-```
+- Linux-like hosts only.
+- No ssh-agent and no `~/.ssh/config`: everything is in the inventory.
+- No automatic rollback: write jobs that can safely run twice.
+- Not yet tested automatically: a real reboot, and a bastion with many
+  parallel tunnels on a real sshd.
 
 ## Development
 
 ```bash
-make check    # gofmt, go vet, go test -race, go build (same as CI)
-make lint     # golangci-lint
-make vuln     # govulncheck: known vulnerabilities in reachable code
-make build    # bin/rco
+make check         # format, vet, tests with -race, build
+make lint          # golangci-lint
+make integration   # tests against Docker containers (OpenSSH, and dropbear with busybox)
 ```
 
-Keep personal test inventories and jobs in `local/` at the repository root.
-It is git-ignored, so hosts and key paths never end up in a commit.
+Unit tests run against an in-process SSH server that can drop connections,
+hang, and fake reboots. Pushing a `v*` tag publishes a release. Keep personal
+inventories in `local/` (git-ignored).
 
-### Code layout
-
-| Package | Purpose |
-|---|---|
-| `cmd/rco` | entry point |
-| `internal/cli` | flags, output formats, preview |
-| `internal/job` | job file parsing, validation, variables, remote command building |
-| `internal/inventory` | inventory parsing, inheritance, host selection |
-| `internal/credentials` | keys, passwords, sudo passwords, redaction |
-| `internal/runner` | parallel execution, retries, expectations, report |
-| `internal/sshx` | SSH dial (with bastion), host keys, exec with bounded output |
-| `internal/sshtest` | in-process SSH server for tests |
-| `test/integration` | Docker target and job for `make integration` |
-
-### Versions and releases
-
-`make build` stamps the version from `git describe --tags --always --dirty`,
-and `rco version` prints it:
-
-| `rco version` | Meaning |
-|---|---|
-| `rco v1.0.0` | built exactly from tag `v1.0.0` |
-| `rco v1.0.0-3-g9c1d2e3` | 3 commits after `v1.0.0`, at commit `9c1d2e3` |
-| `rco 9c1d2e3` | no tags yet, commit `9c1d2e3` |
-| `…-dirty` | built with uncommitted changes, so it matches no commit exactly |
-
-To release, tag `main` and push the tag:
-
-```bash
-git tag v1.0.0 && git push origin v1.0.0
-```
-
-The `release` workflow runs the quality gates, builds
-`rco_<version>_<os>_<arch>.tar.gz` for every platform with `make release`
-(binary, README and LICENSE) plus `checksums.txt`, and publishes them as a
-GitHub Release with generated notes. `make release` does the same locally into `dist/`.
-
-## Limitations
-
-- Linux-like hosts only (POSIX `sh` plus `bash` for scripts). No Windows, no network-device CLIs.
-- No history database. Keep the `--report` files if you need an audit trail.
-- No ssh-agent support, by design.
-- Steps are not rolled back automatically. Write jobs so they can safely be run again.
-
-## Testing
-
-```bash
-make check                      # gofmt, go vet, go test -race, go build (same as CI)
-go test -race -count=1 ./...    # tests only
-make integration                # against a disposable Docker container (needs Docker)
-```
-
-`make integration` builds `test/integration/Dockerfile` (Alpine with real OpenSSH,
-busybox `sh`, GNU coreutils, `bash` and sudo that asks for a password) and runs
-`test/integration/job` against it: password sudo, a `bash` script, a templated
-`copy` next to a planted symlink that must not be followed, and a sensitive
-variable that must not appear in the output. CI runs it as a separate job.
-
-The tests start real SSH servers in-process (`internal/sshtest`). They run
-genuine shell commands in temp directories with a fake `sudo`, so the whole
-suite runs offline in a few seconds. The test server can also drop a connection
-mid-command, go silent without closing it (a link cut with no TCP reset),
-simulate a reboot with a new boot ID, refuse or never answer an
-exec request, and act as a bastion.
-
-Failure modes covered:
-
-| Failure mode | Tests |
-|---|---|
-| Command hangs; Ctrl+C mid-command | `TestExecTimeoutAndCancel`, `TestCancellation` |
-| Server never answers the exec request | `TestExecTimeoutCoversSessionStart` |
-| Connection dies mid-command without a status | `TestUnexpectedDisconnectIsAFailure` |
-| Silent link cut (no TCP reset) during a `disconnect` step: keepalives find it long before the step timeout | `TestSilentDropDetectedByKeepalive` |
-| Host refuses to start the command | `TestSessionFailure`, `TestFireAndForgetRefusedExecFails` |
-| Reboot: host back with a new boot ID, never back, or not rebooted | `TestRebootStep`, `TestRebootHostDoesNotComeBack`, `TestRebootRequiresNewBootID` |
-| Expected disconnect; a disconnect step never runs twice | `TestDisconnectStep`, `TestDisconnectIgnoresDefaultRetries` |
-| Unreachable, refused or timed-out connections; retries only when transient | `TestConnectionFailures`, `TestConnectionRetryAndAuth` |
-| Unknown or changed host key | `TestHostKeyVerification`, `TestAcceptNewHostKeys` |
-| Invalid job, inventory or variables: nothing is contacted | `TestPrepareValidatesEverythingBeforeConnecting`, `TestValidationErrors`, `TestInvalid` |
-| Huge output | `TestExecOutputLimitAndPatterns` |
-| Secrets in output, reports and commands | `TestFullWorkflow`, `TestRedactor`, `TestVarEnvRedactedInCommand` |
-| sudo password never reaches a NOPASSWD command | `TestNoPasswdSudoNeverReceivesPassword` |
-| Too many failed hosts stop the rollout | `TestMaxFailuresAndProgress`, `TestMaxFailuresFromJobAndOverride` |
-| Concurrency limit, shared bastion, goroutine leaks | `TestBoundedConcurrencyManyHosts`, `TestSharedBastion`, `TestNoGoroutineLeaks` |
-| Preview must not touch hosts or existing reports | `TestRunPreviewsByDefaultAndValidateDoesNotConnect`, `TestJSONLReportAndOnlyFailed` |
-| Real sshd, password sudo, `copy` next to a planted symlink (Docker) | `TestIntegrationAlpine` |
-
-## How this was built
-
-Built with an AI coding assistant. I wrote the problem statement and spec, reviewed
-every PR, and designed the checks below.
-
-**Spec:** a single binary that pushes a change over SSH to Linux hosts and says
-exactly what happened on each. Nothing touches a host without `--execute`. Every
-host is validated before any host is contacted. No step may hang on a dead
-connection. Secrets never live in files and never appear in output. Every job
-must say how many failed hosts stop the rollout. Commands that cut their own
-connection get simple, explicit flags, not a general mechanism.
-
-**What I changed or rejected in review:**
-- Rejected a full platform (database, REST server, queue, notifications) for a
-  Linux-only CLI: it was overkill for the problem.
-- Replaced a general reconnect mechanism with three flags, `reboot`, `disconnect`
-  and `fire_and_forget` ([#2](https://github.com/kmpoltorak/remote-command-orchestrator/pull/2)):
-  the general version was too complex to reason about.
-- Made `max_failures` a required field in every job instead of an optional flag
-  ([#2](https://github.com/kmpoltorak/remote-command-orchestrator/pull/2)): the job
-  author must decide how much breakage is acceptable.
-- Removed README claims that no test in the repo backs, as hallucinations
-  ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5)).
-
-**What the tests are there to catch:**
-- `copy` writing through a planted symlink as root → `TestIntegrationAlpine` (real
-  sshd and GNU coreutils in Docker), sabotage-checked
-  ([#5](https://github.com/kmpoltorak/remote-command-orchestrator/pull/5))
-- Silent link cut found only by the step timeout instead of keepalives →
-  `TestSilentDropDetectedByKeepalive`, sabotage-checked
-  ([#8](https://github.com/kmpoltorak/remote-command-orchestrator/pull/8))
-- Hung session setup ignoring timeout and Ctrl+C → `TestExecTimeoutCoversSessionStart`,
-  sabotage-checked ([#4](https://github.com/kmpoltorak/remote-command-orchestrator/pull/4))
-- Refused `fire_and_forget` reported as success → `TestFireAndForgetRefusedExecFails`,
-  sabotage-checked (#4)
-- `defaults.retries` re-running a disconnect step → `TestDisconnectIgnoresDefaultRetries`,
-  sabotage-checked (#4)
-- `--var-env` value leaking into displayed commands → `TestVarEnvRedactedInCommand`,
-  sabotage-checked (#4)
-- Preview overwriting an existing report → `TestJSONLReportAndOnlyFailed`,
-  sabotage-checked (#4)
-
-**What I don't trust yet / known gaps:**
-- OpenWrt (dropbear, busybox) and a bastion with many parallel tunnels were only
-  checked by hand, not in CI.
-- Reboot and disconnect steps are tested only against the in-process test server,
-  not against a real sshd.
-- Inventory and `--var` values are inserted into shell commands as-is; they are
-  trusted input.
+Built with an AI coding assistant. I wrote the spec and reviewed every change.
 
 ## License
 
