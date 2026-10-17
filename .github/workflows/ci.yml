@@ -34,7 +34,8 @@ jobs:
           go-version-file: go.mod
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          # Pinned: a new release can add checks that fail unchanged code. Bump on purpose.
+          version: v2.15.0
 
   integration:
     runs-on: ubuntu-latest
